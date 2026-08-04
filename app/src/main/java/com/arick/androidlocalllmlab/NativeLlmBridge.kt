@@ -8,4 +8,11 @@ object NativeLlmBridge {
     external fun nativeCreateRuntime(): Long
 
     external fun nativeReleaseRuntime(handle: Long)
+
+    external fun nativeLoadModel(
+        handle: Long,
+        modelPath: String
+    ): Boolean
+
+    external fun nativeUnloadModel(handle: Long)
 }
