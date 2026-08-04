@@ -79,9 +79,13 @@ namespace {
 
             llama_free(context_);
             context_ = nullptr;
+            nextPosition_ = 0;
         }
 
-        std::vector<llama_token> tokenize(const std::string &text) const {
+        std::vector<llama_token> tokenize(
+                const std::string &text,
+                bool parseSpecial = false
+        ) const {
             if (model_ == nullptr) {
                 return {};
             }
@@ -100,7 +104,7 @@ namespace {
                     tokens.data(),
                     static_cast<int32_t>(tokens.size()),
                     false,
-                    false
+                    parseSpecial
             );
 
             // llama.cpp 用负数告知“当前 Token 缓冲区不够，实际需要多少个”。
@@ -114,7 +118,7 @@ namespace {
                         tokens.data(),
                         static_cast<int32_t>(tokens.size()),
                         false,
-                        false
+                        parseSpecial
                 );
             }
 
@@ -165,7 +169,85 @@ namespace {
                 return 0;
             }
 
+            nextPosition_ = static_cast<llama_pos>(tokens.size());
             return static_cast<int>(tokens.size());
+        }
+
+        std::string generate(const std::string &userPrompt, int maxTokens) {
+            if (model_ == nullptr || context_ == nullptr || userPrompt.empty() || maxTokens <= 0) {
+                return {};
+            }
+
+            // Qwen2.5 Instruct 的 GGUF 带有 ChatML 模板；nullptr 会让 llama.cpp 使用
+            // 模型默认模板。addAssistant=true 表示结尾追加 assistant 的回复起始标记。
+            const llama_chat_message message = {"user", userPrompt.c_str()};
+            std::vector<char> formattedPrompt(userPrompt.size() + 128);
+            int32_t promptLength = llama_chat_apply_template(
+                    nullptr,
+                    &message,
+                    1,
+                    true,
+                    formattedPrompt.data(),
+                    static_cast<int32_t>(formattedPrompt.size())
+            );
+
+            if (promptLength < 0) {
+                return {};
+            }
+
+            if (promptLength > static_cast<int32_t>(formattedPrompt.size())) {
+                formattedPrompt.resize(static_cast<size_t>(promptLength));
+                promptLength = llama_chat_apply_template(
+                        nullptr,
+                        &message,
+                        1,
+                        true,
+                        formattedPrompt.data(),
+                        static_cast<int32_t>(formattedPrompt.size())
+                );
+            }
+
+            if (promptLength <= 0) {
+                return {};
+            }
+
+            const std::string prompt(
+                    formattedPrompt.data(),
+                    static_cast<size_t>(promptLength)
+            );
+            const std::vector<llama_token> promptTokens = tokenize(prompt, true);
+            if (prefill(promptTokens) != static_cast<int>(promptTokens.size())) {
+                return {};
+            }
+
+            const llama_vocab *vocab = llama_model_get_vocab(model_);
+            if (vocab == nullptr) {
+                return {};
+            }
+
+            llama_sampler *sampler = llama_sampler_init_greedy();
+            if (sampler == nullptr) {
+                return {};
+            }
+
+            std::string answer;
+            for (int index = 0; index < maxTokens; ++index) {
+                const llama_token token = llama_sampler_sample(sampler, context_, -1);
+                if (llama_vocab_is_eog(vocab, token)) {
+                    break;
+                }
+
+                answer += tokenToPiece(token, false);
+                llama_sampler_accept(sampler, token);
+
+                if (!decodeToken(token)) {
+                    answer.clear();
+                    break;
+                }
+            }
+
+            llama_sampler_free(sampler);
+            return answer;
         }
 
         int sampleNextToken() const {
@@ -190,7 +272,7 @@ namespace {
             return token;
         }
 
-        std::string tokenToPiece(llama_token token) const {
+        std::string tokenToPiece(llama_token token, bool special = true) const {
             if (model_ == nullptr) {
                 return {};
             }
@@ -208,7 +290,7 @@ namespace {
                     buffer.data(),
                     static_cast<int32_t>(buffer.size()),
                     0,
-                    true
+                    special
             );
 
             // 返回负数说明 buffer 不够，负数绝对值是所需字节数。
@@ -221,7 +303,7 @@ namespace {
                         buffer.data(),
                         static_cast<int32_t>(buffer.size()),
                         0,
-                        true
+                        special
                 );
             }
 
@@ -235,9 +317,34 @@ namespace {
             };
         }
 
+        bool decodeToken(llama_token token) {
+            if (context_ == nullptr) {
+                return false;
+            }
+
+            llama_batch batch = llama_batch_init(1, 0, 1);
+            batch.token[0] = token;
+            batch.pos[0] = nextPosition_;
+            batch.n_seq_id[0] = 1;
+            batch.seq_id[0][0] = 0;
+            batch.logits[0] = true;
+            batch.n_tokens = 1;
+
+            const int32_t decodeResult = llama_decode(context_, batch);
+            llama_batch_free(batch);
+
+            if (decodeResult != 0) {
+                return false;
+            }
+
+            ++nextPosition_;
+            return true;
+        }
+
     private:
         llama_model *model_ = nullptr;
         llama_context *context_ = nullptr;
+        llama_pos nextPosition_ = 0;
     };
 }
 
@@ -434,4 +541,27 @@ Java_com_arick_androidlocalllmlab_NativeLlmBridge_nativeTokenToPiece(
     );
 
     return env->NewStringUTF(piece.c_str());
+}
+
+extern "C"
+JNIEXPORT jstring JNICALL
+Java_com_arick_androidlocalllmlab_NativeLlmBridge_nativeGenerate(
+        JNIEnv *env,
+        jobject /* thiz */,
+        jlong handle,
+        jstring prompt,
+        jint maxTokens) {
+    auto *runtime = toRuntime(handle);
+    if (runtime == nullptr || prompt == nullptr || maxTokens <= 0) {
+        return env->NewStringUTF("");
+    }
+
+    const char *promptChars = env->GetStringUTFChars(prompt, nullptr);
+    if (promptChars == nullptr) {
+        return env->NewStringUTF("");
+    }
+
+    const std::string answer = runtime->generate(promptChars, maxTokens);
+    env->ReleaseStringUTFChars(prompt, promptChars);
+    return env->NewStringUTF(answer.c_str());
 }

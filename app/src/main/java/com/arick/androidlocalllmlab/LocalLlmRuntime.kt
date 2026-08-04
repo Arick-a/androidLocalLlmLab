@@ -97,4 +97,15 @@ class LocalLlmRuntime : AutoCloseable {
         check(nativeHandle != 0L) { "Runtime has not been created" }
         return NativeLlmBridge.nativeTokenToPiece(nativeHandle, tokenId)
     }
+
+    fun generate(prompt: String, maxTokens: Int): String {
+        check(nativeHandle != 0L) { "Runtime has not been created" }
+        check(maxTokens > 0) { "maxTokens must be positive" }
+
+        return NativeLlmBridge.nativeGenerate(
+            handle = nativeHandle,
+            prompt = prompt,
+            maxTokens = maxTokens
+        )
+    }
 }

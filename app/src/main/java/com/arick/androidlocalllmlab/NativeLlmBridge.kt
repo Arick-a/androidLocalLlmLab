@@ -39,4 +39,10 @@ object NativeLlmBridge {
         handle: Long,
         tokenId: Int
     ): String
+
+    external fun nativeGenerate(
+        handle: Long,
+        prompt: String,
+        maxTokens: Int
+    ): String
 }

@@ -8,6 +8,8 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.background
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -64,6 +66,9 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun ChatScreen(viewModel: ChatViewModel) {
     val uiState by viewModel.uiState.collectAsState()
+    val messages by viewModel.messages.collectAsState()
+    val isGenerating by viewModel.isGenerating.collectAsState()
+    val generationError by viewModel.generationError.collectAsState()
     var prompt by remember { mutableStateOf("") }
     val selectModelLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
@@ -90,8 +95,12 @@ private fun ChatScreen(viewModel: ChatViewModel) {
         bottomBar = {
             ChatComposer(
                 prompt = prompt,
-                enabled = isModelReady,
-                onPromptChange = { prompt = it }
+                enabled = isModelReady && !isGenerating,
+                onPromptChange = { prompt = it },
+                onSend = {
+                    viewModel.send(prompt)
+                    prompt = ""
+                }
             )
         }
     ) { innerPadding ->
@@ -117,13 +126,11 @@ private fun ChatScreen(viewModel: ChatViewModel) {
                 }
 
                 is ChatUiState.Ready -> {
-                    Text(
-                        text = "本地模型已就绪 · n_ctx ${state.nCtx}",
-                        modifier = Modifier
-                            .align(Alignment.TopCenter)
-                            .padding(top = 12.dp),
-                        color = Color(0xFF999999),
-                        fontSize = 12.sp
+                    ChatContent(
+                        nCtx = state.nCtx,
+                        messages = messages,
+                        isGenerating = isGenerating,
+                        errorMessage = generationError
                     )
                 }
 
@@ -184,7 +191,8 @@ private fun ChatHeader(onSelectModel: () -> Unit) {
 private fun ChatComposer(
     prompt: String,
     enabled: Boolean,
-    onPromptChange: (String) -> Unit
+    onPromptChange: (String) -> Unit,
+    onSend: () -> Unit
 ) {
     Column(
         modifier = Modifier
@@ -246,7 +254,7 @@ private fun ChatComposer(
                     IconButton(
                         modifier = Modifier.size(28.dp),
                         enabled = enabled && prompt.isNotBlank(),
-                        onClick = {}
+                        onClick = onSend
                     ) {
                         Icon(
                             imageVector = Icons.Default.ArrowUpward,
@@ -256,6 +264,61 @@ private fun ChatComposer(
                     }
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun ChatContent(
+    nCtx: Int,
+    messages: List<ChatMessage>,
+    isGenerating: Boolean,
+    errorMessage: String?
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 18.dp, vertical = 12.dp)
+    ) {
+        Text(
+            text = "本地模型已就绪 · n_ctx $nCtx",
+            modifier = Modifier.align(Alignment.CenterHorizontally),
+            color = Color(0xFF999999),
+            fontSize = 12.sp
+        )
+
+        messages.forEach { message ->
+            Text(
+                text = if (message.role == MessageRole.User) "我" else "AI",
+                modifier = Modifier.padding(top = 20.dp),
+                color = Color(0xFF777777),
+                fontSize = 12.sp
+            )
+            Text(
+                text = message.content,
+                modifier = Modifier.padding(top = 4.dp),
+                color = Color.Black,
+                fontSize = 16.sp
+            )
+        }
+
+        if (isGenerating) {
+            Text(
+                text = "正在生成…",
+                modifier = Modifier.padding(top = 20.dp),
+                color = Color(0xFF777777),
+                fontSize = 12.sp
+            )
+        }
+
+        if (errorMessage != null) {
+            Text(
+                text = "生成失败：$errorMessage",
+                modifier = Modifier.padding(top = 20.dp),
+                color = Color(0xFFD32F2F),
+                fontSize = 12.sp
+            )
         }
     }
 }

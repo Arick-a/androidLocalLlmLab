@@ -30,6 +30,16 @@ sealed interface ChatUiState {
     ) : ChatUiState
 }
 
+enum class MessageRole {
+    User,
+    Assistant
+}
+
+data class ChatMessage(
+    val role: MessageRole,
+    val content: String
+)
+
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
     // Runtime 持有 JNI 返回的 nativeHandle，生命周期与 ViewModel 一致。
     private val runtime = LocalLlmRuntime()
@@ -38,6 +48,15 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _uiState = MutableStateFlow<ChatUiState>(ChatUiState.Idle)
     val uiState: StateFlow<ChatUiState> = _uiState.asStateFlow()
+
+    private val _messages = MutableStateFlow<List<ChatMessage>>(emptyList())
+    val messages: StateFlow<List<ChatMessage>> = _messages.asStateFlow()
+
+    private val _isGenerating = MutableStateFlow(false)
+    val isGenerating: StateFlow<Boolean> = _isGenerating.asStateFlow()
+
+    private val _generationError = MutableStateFlow<String?>(null)
+    val generationError: StateFlow<String?> = _generationError.asStateFlow()
 
     init {
         // filesDir 中的模型在 App 重启后仍存在，因此可以在新页面自动恢复。
@@ -96,11 +115,42 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         check(actualNctx > 0) { "模型或 Context 创建失败" }
+        _messages.value = emptyList()
+        _generationError.value = null
         _uiState.value = ChatUiState.Ready(modelFile, actualNctx)
     }
 
+    fun send(prompt: String) {
+        if (
+            prompt.isBlank() ||
+            _uiState.value !is ChatUiState.Ready ||
+            _isGenerating.value
+        ) {
+            return
+        }
+
+        // 当前先完成单轮问答：每次发送都用这一句作为全新 prompt，不携带历史消息。
+        _messages.value = listOf(ChatMessage(MessageRole.User, prompt))
+        _generationError.value = null
+        _isGenerating.value = true
+
+        viewModelScope.launch {
+            try {
+                val answer = withContext(Dispatchers.Default) {
+                    runtime.generate(prompt, maxTokens = 128)
+                }
+                check(answer.isNotBlank()) { "模型没有返回内容" }
+                _messages.value = _messages.value + ChatMessage(MessageRole.Assistant, answer)
+            } catch (error: Throwable) {
+                _generationError.value = error.message ?: "生成失败"
+            } finally {
+                _isGenerating.value = false
+            }
+        }
+    }
+
     fun releaseModel() {
-        if (_uiState.value is ChatUiState.Preparing) {
+        if (_uiState.value is ChatUiState.Preparing || _isGenerating.value) {
             return
         }
 
