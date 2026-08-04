@@ -5,6 +5,8 @@ plugins {
 
 android {
     namespace = "com.arick.androidlocalllmlab"
+    ndkVersion = "26.3.11579264"
+
     compileSdk {
         version = release(36) {
             minorApiLevel = 1
@@ -17,8 +19,22 @@ android {
         targetSdk = 36
         versionCode = 1
         versionName = "1.0"
-
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
+        externalNativeBuild {
+            cmake {
+                cppFlags += "-std=c++17"
+            }
+        }
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
     }
 
     buildTypes {
