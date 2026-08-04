@@ -15,4 +15,11 @@ object NativeLlmBridge {
     ): Boolean
 
     external fun nativeUnloadModel(handle: Long)
+
+    external fun nativeCreateContext(
+        handle: Long,
+        requestedNctx: Int
+    ): Int
+
+    external fun nativeReleaseContext(handle: Long)
 }

@@ -45,6 +45,7 @@ namespace {
         }
 
         void unloadModel() {
+            releaseContext();
             if (model_ == nullptr) {
                 return;
             }
@@ -53,8 +54,36 @@ namespace {
             model_ = nullptr;
         }
 
+        int createContext(uint32_t requestedNctx) {
+            if (model_ == nullptr || context_ != nullptr) {
+                return 0;
+            }
+
+            llama_context_params params = llama_context_default_params();
+            params.n_ctx = requestedNctx;
+            params.n_batch = 512;
+            params.n_ubatch = 512;
+
+            context_ = llama_init_from_model(model_, params);
+            if (context_ == nullptr) {
+                return 0;
+            }
+
+            return static_cast<int>(llama_n_ctx(context_));
+        }
+
+        void releaseContext() {
+            if (context_ == nullptr) {
+                return;
+            }
+
+            llama_free(context_);
+            context_ = nullptr;
+        }
+
     private:
         llama_model *model_ = nullptr;
+        llama_context *context_ = nullptr;
     };
 }
 
@@ -116,5 +145,34 @@ Java_com_arick_androidlocalllmlab_NativeLlmBridge_nativeUnloadModel(
     auto *runtime = toRuntime(handle);
     if (runtime != nullptr) {
         runtime->unloadModel();
+    }
+}
+
+extern "C"
+JNIEXPORT jint JNICALL
+Java_com_arick_androidlocalllmlab_NativeLlmBridge_nativeCreateContext(
+        JNIEnv *env,
+        jobject /* thiz */,
+        jlong handle,
+        jint requestedNctx) {
+    auto *runtime = toRuntime(handle);
+    if (runtime == nullptr || requestedNctx <= 0) {
+        return 0;
+    }
+
+    return runtime->createContext(
+            static_cast<uint32_t>(requestedNctx)
+    );
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_arick_androidlocalllmlab_NativeLlmBridge_nativeReleaseContext(
+        JNIEnv *env,
+        jobject /* thiz */,
+        jlong handle) {
+    auto *runtime = toRuntime(handle);
+    if (runtime != nullptr) {
+        runtime->releaseContext();
     }
 }
