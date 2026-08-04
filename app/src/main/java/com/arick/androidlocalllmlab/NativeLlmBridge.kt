@@ -22,4 +22,21 @@ object NativeLlmBridge {
     ): Int
 
     external fun nativeReleaseContext(handle: Long)
+
+    external fun nativeTokenize(
+        handle: Long,
+        text: String
+    ): IntArray
+
+    external fun nativePrefill(
+        handle: Long,
+        tokenIds: IntArray
+    ): Int
+
+    external fun nativeSampleNextToken(handle: Long): Int
+
+    external fun nativeTokenToPiece(
+        handle: Long,
+        tokenId: Int
+    ): String
 }

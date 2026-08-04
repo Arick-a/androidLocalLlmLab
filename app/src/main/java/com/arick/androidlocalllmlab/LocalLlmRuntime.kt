@@ -69,4 +69,32 @@ class LocalLlmRuntime : AutoCloseable {
 
         return actualNctx
     }
+
+    fun tokenize(text: String): IntArray {
+        check(nativeHandle != 0L) { "Runtime has not been created" }
+
+        return NativeLlmBridge.nativeTokenize(
+            handle = nativeHandle,
+            text = text
+        )
+    }
+
+    fun prefill(tokenIds: IntArray): Int {
+        check(nativeHandle != 0L) { "Runtime has not been created" }
+
+        return NativeLlmBridge.nativePrefill(
+            handle = nativeHandle,
+            tokenIds = tokenIds
+        )
+    }
+
+    fun sampleNextToken(): Int {
+        check(nativeHandle != 0L) { "Runtime has not been created" }
+        return NativeLlmBridge.nativeSampleNextToken(nativeHandle)
+    }
+
+    fun tokenToPiece(tokenId: Int): String {
+        check(nativeHandle != 0L) { "Runtime has not been created" }
+        return NativeLlmBridge.nativeTokenToPiece(nativeHandle, tokenId)
+    }
 }
