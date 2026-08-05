@@ -2,6 +2,7 @@ package com.arick.androidlocalllmlab
 
 class LocalLlmRuntime : AutoCloseable {
     private var nativeHandle: Long = 0L
+    private var cpuThreads: Int = 1
     val isCreated: Boolean
         get() = nativeHandle != 0L
 
@@ -27,14 +28,28 @@ class LocalLlmRuntime : AutoCloseable {
         NativeLlmBridge.nativeUnloadModel(nativeHandle)
     }
 
+    fun modelDescription(): String {
+        check(nativeHandle != 0L) { "Runtime has not been created" }
+        return NativeLlmBridge.nativeModelDescription(nativeHandle)
+    }
+
+    fun modelMetadata(key: String): String {
+        check(nativeHandle != 0L) { "Runtime has not been created" }
+        return NativeLlmBridge.nativeModelMetadata(nativeHandle, key)
+    }
+
     fun createContext(requestedNctx: Int): Int {
         check(nativeHandle != 0L) { "Runtime has not been created" }
         check(requestedNctx > 0) { "n_ctx must be positive" }
 
-        return NativeLlmBridge.nativeCreateContext(
+        val actualNctx = NativeLlmBridge.nativeCreateContext(
             nativeHandle,
             requestedNctx
         )
+        if (actualNctx > 0) {
+            NativeLlmBridge.nativeSetThreads(nativeHandle, cpuThreads, cpuThreads)
+        }
+        return actualNctx
     }
 
     fun releaseContext() {
@@ -66,8 +81,10 @@ class LocalLlmRuntime : AutoCloseable {
 
     fun prepareModel(
         modelPath: String,
-        requestedNctx: Int
+        requestedNctx: Int,
+        cpuThreads: Int
     ): Int {
+        this.cpuThreads = cpuThreads
         createIfNeeded()
 
         // 切换模型前先释放旧 Context 和旧模型，避免旧 KV Cache 和权重继续占用 Native 内存。
@@ -93,6 +110,19 @@ class LocalLlmRuntime : AutoCloseable {
         // 只重建推理现场：模型权重仍留在 Native 内存中，旧 KV Cache 会随 Context 释放。
         releaseContext()
         return createContext(requestedNctx)
+    }
+
+    /**
+     * llama.cpp 区分单 Token Decode 和批量 Prefill 的线程数。
+     * 当前实验先让两者使用同一个值，避免一次引入两个变量。
+     */
+    fun setCpuThreads(threads: Int): Int {
+        check(threads > 0) { "cpu threads must be positive" }
+        cpuThreads = threads
+        if (nativeHandle == 0L) {
+            return cpuThreads
+        }
+        return NativeLlmBridge.nativeSetThreads(nativeHandle, threads, threads)
     }
 
     fun tokenize(text: String): IntArray {
@@ -121,7 +151,7 @@ class LocalLlmRuntime : AutoCloseable {
                     MessageRole.Assistant -> "assistant"
                 }
             }.toTypedArray(),
-            contents = messages.map(ChatMessage::content).toTypedArray()
+            contents = messages.map(ChatMessage::toNativeContent).toTypedArray()
         )
     }
 
@@ -146,13 +176,14 @@ class LocalLlmRuntime : AutoCloseable {
 
     fun generate(
         messages: List<ChatMessage>,
-        maxTokens: Int,
+        inferenceConfig: InferenceConfig,
         onPrompt: (String, Int) -> Unit,
-        onToken: (String) -> Unit
+        onToken: (String) -> Unit,
+        onMetrics: (GenerationMetrics) -> Unit
     ): String {
         check(nativeHandle != 0L) { "Runtime has not been created" }
         check(messages.isNotEmpty()) { "messages must not be empty" }
-        check(maxTokens > 0) { "maxTokens must be positive" }
+        check(inferenceConfig.maxTokens > 0) { "maxTokens must be positive" }
 
         return NativeLlmBridge.nativeGenerate(
             handle = nativeHandle,
@@ -163,14 +194,73 @@ class LocalLlmRuntime : AutoCloseable {
                     MessageRole.Assistant -> "assistant"
                 }
             }.toTypedArray(),
-            contents = messages.map(ChatMessage::content).toTypedArray(),
-            maxTokens = maxTokens,
+            contents = messages.map(ChatMessage::toNativeContent).toTypedArray(),
+            maxTokens = inferenceConfig.maxTokens,
+            temperature = inferenceConfig.temperature,
+            topK = inferenceConfig.topK,
+            topP = inferenceConfig.topP,
+            minP = inferenceConfig.minP,
+            repeatPenalty = inferenceConfig.repeatPenalty,
+            seed = inferenceConfig.seed,
             generationCallback = object : NativeGenerationCallback {
                 override fun onPrompt(prompt: String, tokenCount: Int) =
                     onPrompt(prompt, tokenCount)
 
                 override fun onToken(piece: String) = onToken(piece)
+
+                override fun onMetrics(
+                    generatedTokenCount: Int,
+                    prefillMillis: Long,
+                    firstTokenMillis: Long,
+                    decodeMillis: Long,
+                    totalMillis: Long
+                ) = onMetrics(
+                    GenerationMetrics(
+                        generatedTokenCount = generatedTokenCount,
+                        prefillMillis = prefillMillis,
+                        firstTokenMillis = firstTokenMillis,
+                        decodeMillis = decodeMillis,
+                        totalMillis = totalMillis
+                    )
+                )
             }
         )
     }
+}
+
+/** Native 仍需看到完整 assistant 轨迹；UI 只是把 reasoning 从普通回答中分栏展示。 */
+private fun ChatMessage.toNativeContent(): String {
+    if (role != MessageRole.Assistant || reasoningContent.isBlank()) {
+        return content
+    }
+    return "<think>\n$reasoningContent\n</think>\n\n$content"
+}
+
+/**
+ * 采样器配置。temperature 为 0 时 Native 使用 greedy，其他随机采样参数不会参与选词；
+ * 这样可以保留当前稳定、可复现的默认行为。
+ */
+data class InferenceConfig(
+    val temperature: Float = 0f,
+    val topK: Int = 40,
+    val topP: Float = 0.95f,
+    val minP: Float = 0.05f,
+    val repeatPenalty: Float = 1.10f,
+    val seed: Int = 42,
+    val maxTokens: Int = 256
+) {
+    val isGreedy: Boolean
+        get() = temperature <= 0f
+}
+
+/** 一轮 Native 推理的真实耗时；单位统一为毫秒，避免 Kotlin 侧猜测。 */
+data class GenerationMetrics(
+    val generatedTokenCount: Int,
+    val prefillMillis: Long,
+    val firstTokenMillis: Long,
+    val decodeMillis: Long,
+    val totalMillis: Long
+) {
+    val decodeTokensPerSecond: Double
+        get() = if (decodeMillis <= 0L) 0.0 else generatedTokenCount * 1_000.0 / decodeMillis
 }

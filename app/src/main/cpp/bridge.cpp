@@ -2,6 +2,7 @@
 #include <android/log.h>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <functional>
 #include <string>
 #include <vector>
@@ -14,6 +15,15 @@ namespace {
     struct ChatMessage {
         std::string role;
         std::string content;
+    };
+
+    struct SamplingConfig {
+        float temperature;
+        int topK;
+        float topP;
+        float minP;
+        float repeatPenalty;
+        uint32_t seed;
     };
 
     class NativeRuntime {
@@ -62,6 +72,35 @@ namespace {
             model_ = nullptr;
         }
 
+        std::string modelDescription() const {
+            if (model_ == nullptr) {
+                return {};
+            }
+            std::vector<char> buffer(256);
+            const int32_t length = llama_model_desc(model_, buffer.data(), buffer.size());
+            if (length <= 0) {
+                return {};
+            }
+            return {buffer.data(), static_cast<size_t>(length)};
+        }
+
+        std::string modelMetadata(const char *key) const {
+            if (model_ == nullptr || key == nullptr) {
+                return {};
+            }
+            std::vector<char> buffer(256);
+            const int32_t length = llama_model_meta_val_str(
+                    model_,
+                    key,
+                    buffer.data(),
+                    buffer.size()
+            );
+            if (length <= 0) {
+                return {};
+            }
+            return {buffer.data(), static_cast<size_t>(length)};
+        }
+
         int createContext(uint32_t requestedNctx) {
             if (model_ == nullptr || context_ != nullptr) {
                 return 0;
@@ -98,6 +137,15 @@ namespace {
 
             llama_memory_clear(llama_get_memory(context_), false);
             nextPosition_ = 0;
+        }
+
+        int setThreads(int generationThreads, int batchThreads) {
+            if (context_ == nullptr || generationThreads <= 0 || batchThreads <= 0) {
+                return 0;
+            }
+
+            llama_set_n_threads(context_, generationThreads, batchThreads);
+            return llama_n_threads(context_);
         }
 
         void requestStop() {
@@ -278,8 +326,10 @@ namespace {
         std::string generate(
                 const std::vector<ChatMessage> &history,
                 int maxTokens,
+                const SamplingConfig &samplingConfig,
                 const std::function<bool(const std::string &, int)> &onPrompt,
-                const std::function<bool(const std::string &)> &onToken
+                const std::function<bool(const std::string &)> &onToken,
+                const std::function<void(int, int64_t, int64_t, int64_t, int64_t)> &onMetrics
         ) {
             if (model_ == nullptr || context_ == nullptr || history.empty() || maxTokens <= 0) {
                 return {};
@@ -289,6 +339,8 @@ namespace {
                 return {};
             }
 
+            using Clock = std::chrono::steady_clock;
+            const auto generationStartedAt = Clock::now();
             const std::string prompt = formatChatPrompt(history);
             if (prompt.empty()) {
                 return {};
@@ -301,9 +353,14 @@ namespace {
                 return {};
             }
 
+            const auto prefillStartedAt = Clock::now();
             if (prefill(promptTokens) != static_cast<int>(promptTokens.size())) {
                 return {};
             }
+            const auto prefillFinishedAt = Clock::now();
+            const auto prefillMillis = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    prefillFinishedAt - prefillStartedAt
+            ).count();
 
             if (stopRequested_.load()) {
                 return {};
@@ -314,12 +371,15 @@ namespace {
                 return {};
             }
 
-            llama_sampler *sampler = llama_sampler_init_greedy();
+            llama_sampler *sampler = createSampler(samplingConfig);
             if (sampler == nullptr) {
                 return {};
             }
 
             std::string answer;
+            int generatedTokenCount = 0;
+            int64_t firstTokenMillis = -1;
+            const auto decodeStartedAt = Clock::now();
             for (int index = 0; index < maxTokens; ++index) {
                 // JNI 的停止请求可以在 Kotlin 主线程写入；atomic 让 Native 推理线程
                 // 无锁地安全读取。最迟在当前一个 Token 完成后退出。
@@ -334,6 +394,12 @@ namespace {
 
                 const std::string piece = tokenToPiece(token, false);
                 answer += piece;
+                ++generatedTokenCount;
+                if (firstTokenMillis < 0) {
+                    firstTokenMillis = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            Clock::now() - generationStartedAt
+                    ).count();
+                }
 
                 // Native 每采样出一个 Token，就把对应文字片段推回 Kotlin。
                 // 这样 Compose 不必等完整回答生成完才更新页面。
@@ -355,6 +421,20 @@ namespace {
             }
 
             llama_sampler_free(sampler);
+            const auto generationFinishedAt = Clock::now();
+            const auto decodeMillis = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    generationFinishedAt - decodeStartedAt
+            ).count();
+            const auto totalMillis = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    generationFinishedAt - generationStartedAt
+            ).count();
+            onMetrics(
+                    generatedTokenCount,
+                    prefillMillis,
+                    firstTokenMillis < 0 ? totalMillis : firstTokenMillis,
+                    decodeMillis,
+                    totalMillis
+            );
             return answer;
         }
 
@@ -447,6 +527,33 @@ namespace {
 
             ++nextPosition_;
             return true;
+        }
+
+        llama_sampler *createSampler(const SamplingConfig &config) const {
+            // temperature=0 保持原先的 greedy 语义：每一步总选概率最高的 token。
+            if (config.temperature <= 0.0f) {
+                return llama_sampler_init_greedy();
+            }
+
+            auto chainParams = llama_sampler_chain_default_params();
+            llama_sampler *chain = llama_sampler_chain_init(chainParams);
+            if (chain == nullptr) {
+                return nullptr;
+            }
+
+            // 每个 sampler 的所有权转交给 chain；最后的 dist 负责按 seed 抽样。
+            llama_sampler_chain_add(chain, llama_sampler_init_top_k(config.topK));
+            llama_sampler_chain_add(chain, llama_sampler_init_top_p(config.topP, 1));
+            llama_sampler_chain_add(chain, llama_sampler_init_min_p(config.minP, 1));
+            llama_sampler_chain_add(chain, llama_sampler_init_penalties(
+                    64,
+                    config.repeatPenalty,
+                    0.0f,
+                    0.0f
+            ));
+            llama_sampler_chain_add(chain, llama_sampler_init_temp(config.temperature));
+            llama_sampler_chain_add(chain, llama_sampler_init_dist(config.seed));
+            return chain;
         }
 
     private:
@@ -573,6 +680,39 @@ Java_com_arick_androidlocalllmlab_NativeLlmBridge_nativeUnloadModel(
 }
 
 extern "C"
+JNIEXPORT jstring JNICALL
+Java_com_arick_androidlocalllmlab_NativeLlmBridge_nativeModelDescription(
+        JNIEnv *env,
+        jobject /* thiz */,
+        jlong handle) {
+    auto *runtime = toRuntime(handle);
+    if (runtime == nullptr) {
+        return env->NewStringUTF("");
+    }
+    return env->NewStringUTF(runtime->modelDescription().c_str());
+}
+
+extern "C"
+JNIEXPORT jstring JNICALL
+Java_com_arick_androidlocalllmlab_NativeLlmBridge_nativeModelMetadata(
+        JNIEnv *env,
+        jobject /* thiz */,
+        jlong handle,
+        jstring key) {
+    auto *runtime = toRuntime(handle);
+    const char *keyChars = key == nullptr ? nullptr : env->GetStringUTFChars(key, nullptr);
+    if (runtime == nullptr || keyChars == nullptr) {
+        if (keyChars != nullptr) {
+            env->ReleaseStringUTFChars(key, keyChars);
+        }
+        return env->NewStringUTF("");
+    }
+    const std::string value = runtime->modelMetadata(keyChars);
+    env->ReleaseStringUTFChars(key, keyChars);
+    return env->NewStringUTF(value.c_str());
+}
+
+extern "C"
 JNIEXPORT jint JNICALL
 Java_com_arick_androidlocalllmlab_NativeLlmBridge_nativeCreateContext(
         JNIEnv *env,
@@ -611,6 +751,22 @@ Java_com_arick_androidlocalllmlab_NativeLlmBridge_nativeResetContext(
     if (runtime != nullptr) {
         runtime->resetContext();
     }
+}
+
+extern "C"
+JNIEXPORT jint JNICALL
+Java_com_arick_androidlocalllmlab_NativeLlmBridge_nativeSetThreads(
+        JNIEnv *env,
+        jobject /* thiz */,
+        jlong handle,
+        jint generationThreads,
+        jint batchThreads) {
+    auto *runtime = toRuntime(handle);
+    if (runtime == nullptr) {
+        return 0;
+    }
+
+    return static_cast<jint>(runtime->setThreads(generationThreads, batchThreads));
 }
 
 extern "C"
@@ -768,6 +924,12 @@ Java_com_arick_androidlocalllmlab_NativeLlmBridge_nativeGenerate(
         jobjectArray roles,
         jobjectArray contents,
         jint maxTokens,
+        jfloat temperature,
+        jint topK,
+        jfloat topP,
+        jfloat minP,
+        jfloat repeatPenalty,
+        jint seed,
         jobject generationCallback) {
     auto *runtime = toRuntime(handle);
     if (runtime == nullptr || maxTokens <= 0 || generationCallback == nullptr) {
@@ -786,7 +948,10 @@ Java_com_arick_androidlocalllmlab_NativeLlmBridge_nativeGenerate(
     jmethodID onTokenMethod = callbackClass == nullptr
             ? nullptr
             : env->GetMethodID(callbackClass, "onToken", "(Ljava/lang/String;)V");
-    if (onPromptMethod == nullptr || onTokenMethod == nullptr) {
+    jmethodID onMetricsMethod = callbackClass == nullptr
+            ? nullptr
+            : env->GetMethodID(callbackClass, "onMetrics", "(IJJJJ)V");
+    if (onPromptMethod == nullptr || onTokenMethod == nullptr || onMetricsMethod == nullptr) {
         env->ExceptionClear();
         return env->NewStringUTF("");
     }
@@ -794,6 +959,14 @@ Java_com_arick_androidlocalllmlab_NativeLlmBridge_nativeGenerate(
     const std::string answer = runtime->generate(
             history,
             maxTokens,
+            SamplingConfig{
+                    temperature,
+                    topK,
+                    topP,
+                    minP,
+                    repeatPenalty,
+                    static_cast<uint32_t>(seed)
+            },
             [env, generationCallback, onPromptMethod](const std::string &prompt, int tokenCount) {
                 jstring kotlinPrompt = env->NewStringUTF(prompt.c_str());
                 if (kotlinPrompt == nullptr) {
@@ -828,6 +1001,25 @@ Java_com_arick_androidlocalllmlab_NativeLlmBridge_nativeGenerate(
                     return false;
                 }
                 return true;
+            },
+            [env, generationCallback, onMetricsMethod](
+                    int generatedTokenCount,
+                    int64_t prefillMillis,
+                    int64_t firstTokenMillis,
+                    int64_t decodeMillis,
+                    int64_t totalMillis) {
+                env->CallVoidMethod(
+                        generationCallback,
+                        onMetricsMethod,
+                        static_cast<jint>(generatedTokenCount),
+                        static_cast<jlong>(prefillMillis),
+                        static_cast<jlong>(firstTokenMillis),
+                        static_cast<jlong>(decodeMillis),
+                        static_cast<jlong>(totalMillis)
+                );
+                if (env->ExceptionCheck()) {
+                    env->ExceptionClear();
+                }
             }
     );
     return env->NewStringUTF(answer.c_str());

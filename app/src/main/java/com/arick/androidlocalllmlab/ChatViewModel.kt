@@ -22,7 +22,9 @@ sealed interface ChatUiState {
 
     data class Ready(
         val modelFile: File,
-        val nCtx: Int
+        val nCtx: Int,
+        val modelDescription: String,
+        val modelName: String
     ) : ChatUiState
 
     data class Error(
@@ -38,13 +40,14 @@ enum class MessageRole {
 
 data class ChatMessage(
     val role: MessageRole,
-    val content: String
+    val content: String,
+    // reasoning 不直接混入普通回答；展示层可将它渲染为可折叠区域。
+    val reasoningContent: String = ""
 )
 
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private companion object {
-        // 生成区必须提前留出空间；否则 Prompt 即使刚好填满 n_ctx，Decode 也无法继续。
-        const val MAX_GENERATION_TOKENS = 128
+        val DEFAULT_CPU_THREADS = Runtime.getRuntime().availableProcessors().coerceIn(1, 8)
     }
 
     // Runtime 持有 JNI 返回的 nativeHandle，生命周期与 ViewModel 一致。
@@ -74,6 +77,22 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _requestedNctx = MutableStateFlow(2048)
     val requestedNctx: StateFlow<Int> = _requestedNctx.asStateFlow()
+
+    // 当前实验真机已验证 8 线程更快；仍限制为设备实际可用核心数，设置页可继续做对照实验。
+    private val _cpuThreads = MutableStateFlow(DEFAULT_CPU_THREADS)
+    val cpuThreads: StateFlow<Int> = _cpuThreads.asStateFlow()
+
+    private val _inferenceConfig = MutableStateFlow(InferenceConfig())
+    val inferenceConfig: StateFlow<InferenceConfig> = _inferenceConfig.asStateFlow()
+
+    private val _thinkingEnabled = MutableStateFlow(true)
+    val thinkingEnabled: StateFlow<Boolean> = _thinkingEnabled.asStateFlow()
+
+    private val _generationProgress = MutableStateFlow<String?>(null)
+    val generationProgress: StateFlow<String?> = _generationProgress.asStateFlow()
+
+    private val _generationMetrics = MutableStateFlow<GenerationMetrics?>(null)
+    val generationMetrics: StateFlow<GenerationMetrics?> = _generationMetrics.asStateFlow()
 
     private val _isGenerating = MutableStateFlow(false)
     val isGenerating: StateFlow<Boolean> = _isGenerating.asStateFlow()
@@ -136,17 +155,30 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             // Native 模型加载与 Context 分配可能耗时，不能阻塞 Compose 主线程。
             runtime.prepareModel(
                 modelPath = modelFile.absolutePath,
-                requestedNctx = _requestedNctx.value
+                requestedNctx = _requestedNctx.value,
+                cpuThreads = _cpuThreads.value
             )
         }
 
         check(actualNctx > 0) { "模型或 Context 创建失败" }
+        val modelDescription = withContext(Dispatchers.Default) {
+            runtime.modelDescription()
+        }
+        val modelName = withContext(Dispatchers.Default) {
+            runtime.modelMetadata("general.name")
+        }
+        // Qwen3-Instruct-2507 官方仅支持非思考模式，不能沿用上个模型的开关状态。
+        if ("$modelName $modelDescription".contains("instruct-2507", ignoreCase = true)) {
+            _thinkingEnabled.value = false
+        }
         _messages.value = emptyList()
         _finalPrompt.value = ""
         _promptTokenCount.value = 0
         _trimmedHistoryTurnCount.value = 0
+        _generationProgress.value = null
+        _generationMetrics.value = null
         _generationError.value = null
-        _uiState.value = ChatUiState.Ready(modelFile, actualNctx)
+        _uiState.value = ChatUiState.Ready(modelFile, actualNctx, modelDescription, modelName)
     }
 
     fun send(prompt: String) {
@@ -163,6 +195,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val visibleHistory = _messages.value.filter { it.content.isNotBlank() }
         val actualNctx = (_uiState.value as? ChatUiState.Ready)?.nCtx ?: return
         val systemPrompt = _systemPrompt.value.trim().takeIf { it.isNotEmpty() }
+        val inferenceConfig = _inferenceConfig.value
+        val nativeUserPrompt = prompt.withQwen3ThinkingInstruction()
         _messages.value = visibleHistory + ChatMessage(
             MessageRole.User,
             prompt
@@ -173,6 +207,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         _finalPrompt.value = ""
         _promptTokenCount.value = 0
         _trimmedHistoryTurnCount.value = 0
+        _generationProgress.value = "正在准备 Prompt…"
+        _generationMetrics.value = null
         // 必须在启动协程前清除上次的停止标记，否则下一轮会立即被旧请求取消。
         runtime.resetStopRequest()
         _isStopRequested.value = false
@@ -184,28 +220,46 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     val trimmedHistory = buildHistoryWithinContextBudget(
                         systemPrompt = systemPrompt,
                         visibleHistory = visibleHistory,
-                        currentUserPrompt = prompt,
-                        nCtx = actualNctx
+                        currentUserPrompt = nativeUserPrompt,
+                        nCtx = actualNctx,
+                        reservedOutputTokens = inferenceConfig.maxTokens
                     )
                     _trimmedHistoryTurnCount.value = trimmedHistory.droppedTurnCount
 
+                    var assistantRawContent = ""
+                    var templateStartsThinking = false
                     runtime.generate(
                         messages = trimmedHistory.messages,
-                        maxTokens = MAX_GENERATION_TOKENS,
+                        inferenceConfig = inferenceConfig,
                         onPrompt = { finalPrompt, tokenCount ->
                             _finalPrompt.value = finalPrompt
                             _promptTokenCount.value = tokenCount
-                        }
-                    ) { piece ->
-                        val currentMessages = _messages.value
-                        _messages.value = currentMessages.mapIndexed { index, message ->
-                            if (index == currentMessages.lastIndex) {
-                                message.copy(content = message.content + piece)
-                            } else {
-                                message
+                            _generationProgress.value = "正在理解 $tokenCount tokens…"
+                            templateStartsThinking = finalPrompt.trimEnd().endsWith("<think>")
+                        },
+                        onToken = { piece ->
+                            _generationProgress.value = "正在生成回复…"
+                            assistantRawContent += piece
+                            val assistantParts = splitAssistantResponse(
+                                rawContent = assistantRawContent,
+                                templateStartsThinking = templateStartsThinking
+                            )
+                            val currentMessages = _messages.value
+                            _messages.value = currentMessages.mapIndexed { index, message ->
+                                if (index == currentMessages.lastIndex) {
+                                    message.copy(
+                                        content = assistantParts.answer,
+                                        reasoningContent = assistantParts.reasoning
+                                    )
+                                } else {
+                                    message
+                                }
                             }
+                        },
+                        onMetrics = { metrics ->
+                            _generationMetrics.value = metrics
                         }
-                    }
+                    )
                 }
                 if (answer.isBlank() && !_isStopRequested.value) {
                     error("模型没有返回内容")
@@ -213,6 +267,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             } catch (error: Throwable) {
                 _generationError.value = error.message ?: "生成失败"
             } finally {
+                _generationProgress.value = null
                 _isGenerating.value = false
                 _isStopRequested.value = false
             }
@@ -227,9 +282,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         systemPrompt: String?,
         visibleHistory: List<ChatMessage>,
         currentUserPrompt: String,
-        nCtx: Int
+        nCtx: Int,
+        reservedOutputTokens: Int
     ): TrimmedHistory {
-        val promptBudget = nCtx - MAX_GENERATION_TOKENS
+        // 生成区必须提前留出空间；否则 Prompt 即使刚好填满 n_ctx，Decode 也无法继续。
+        val promptBudget = nCtx - reservedOutputTokens
         check(promptBudget > 0) { "上下文窗口不足以预留回复空间" }
 
         val baseMessages = buildList {
@@ -324,7 +381,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 check(actualNctx > 0) { "Context 创建失败" }
 
                 _requestedNctx.value = requestedNctx
-                _uiState.value = ChatUiState.Ready(currentState.modelFile, actualNctx)
+                _uiState.value = ChatUiState.Ready(
+                    currentState.modelFile,
+                    actualNctx,
+                    currentState.modelDescription,
+                    currentState.modelName
+                )
             } catch (error: Throwable) {
                 _uiState.value = ChatUiState.Error(
                     error.message ?: "Context 重建失败"
@@ -332,6 +394,103 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
     }
+
+    /** 不重建 Context，直接更新 llama.cpp 的 Decode 与 Prefill 线程数。 */
+    fun updateCpuThreads(threads: Int) {
+        if (threads <= 0 || _isGenerating.value || _uiState.value is ChatUiState.Preparing) {
+            return
+        }
+        _cpuThreads.value = threads
+        if (_uiState.value is ChatUiState.Ready) {
+            viewModelScope.launch {
+                withContext(Dispatchers.Default) {
+                    runtime.setCpuThreads(threads)
+                }
+            }
+        }
+    }
+
+    fun updateInferenceConfig(config: InferenceConfig) {
+        if (_isGenerating.value) {
+            return
+        }
+        require(config.temperature >= 0f) { "temperature must not be negative" }
+        require(config.topK >= 0) { "topK must not be negative" }
+        require(config.topP in 0f..1f) { "topP must be between 0 and 1" }
+        require(config.minP in 0f..1f) { "minP must be between 0 and 1" }
+        require(config.repeatPenalty > 0f) { "repeatPenalty must be positive" }
+        require(config.maxTokens > 0) { "maxTokens must be positive" }
+        val actualNctx = (_uiState.value as? ChatUiState.Ready)?.nCtx
+        require(actualNctx == null || config.maxTokens < actualNctx) {
+            "maxTokens must be smaller than n_ctx"
+        }
+        _inferenceConfig.value = config
+    }
+
+    fun updateThinkingEnabled(enabled: Boolean) {
+        if (!_isGenerating.value) {
+            _thinkingEnabled.value = enabled
+        }
+    }
+
+    /** Qwen3 的软开关必须跟随最新 user 消息；UI 中仍只保留用户原始问题。 */
+    private fun String.withQwen3ThinkingInstruction(): String {
+        val readyState = _uiState.value as? ChatUiState.Ready
+            ?: return this
+        if (!readyState.supportsQwen3ThinkingSwitch()) {
+            return this
+        }
+        return "$this\n${if (_thinkingEnabled.value) "/think" else "/no_think"}"
+    }
+
+    private fun ChatUiState.Ready.supportsQwen3ThinkingSwitch(): Boolean {
+        val identity = "$modelName $modelDescription"
+        return identity.contains("qwen3", ignoreCase = true) &&
+                !identity.contains("instruct-2507", ignoreCase = true)
+    }
+
+    private fun splitAssistantResponse(
+        rawContent: String,
+        templateStartsThinking: Boolean
+    ): AssistantResponseParts {
+        val openingTag = "<think>"
+        val closingTag = "</think>"
+        val openingIndex = rawContent.indexOf(openingTag)
+        if (openingIndex >= 0) {
+            val reasoningStart = openingIndex + openingTag.length
+            val closingIndex = rawContent.indexOf(closingTag, reasoningStart)
+            return if (closingIndex >= 0) {
+                AssistantResponseParts(
+                    reasoning = rawContent.substring(reasoningStart, closingIndex).trim(),
+                    answer = rawContent.substring(closingIndex + closingTag.length).trimStart()
+                )
+            } else {
+                AssistantResponseParts(
+                    reasoning = rawContent.substring(reasoningStart).trimStart(),
+                    answer = rawContent.substring(0, openingIndex).trim()
+                )
+            }
+        }
+
+        // 部分 Qwen3 模板已在 generation prompt 中写入 <think>，模型只回传正文和 </think>。
+        if (templateStartsThinking) {
+            val closingIndex = rawContent.indexOf(closingTag)
+            return if (closingIndex >= 0) {
+                AssistantResponseParts(
+                    reasoning = rawContent.substring(0, closingIndex).trim(),
+                    answer = rawContent.substring(closingIndex + closingTag.length).trimStart()
+                )
+            } else {
+                AssistantResponseParts(reasoning = rawContent.trimStart(), answer = "")
+            }
+        }
+        return AssistantResponseParts(reasoning = "", answer = rawContent)
+    }
+
+    private data class AssistantResponseParts(
+        val reasoning: String,
+        val answer: String
+    )
 
     fun stopGenerating() {
         if (!_isGenerating.value || _isStopRequested.value) {
@@ -397,6 +556,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         _finalPrompt.value = ""
         _promptTokenCount.value = 0
         _trimmedHistoryTurnCount.value = 0
+        _generationProgress.value = null
+        _generationMetrics.value = null
     }
 
     override fun onCleared() {

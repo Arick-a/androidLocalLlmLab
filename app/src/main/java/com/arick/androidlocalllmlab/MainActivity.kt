@@ -30,6 +30,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowUpward
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -41,7 +43,9 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberDrawerState
@@ -62,6 +66,8 @@ import androidx.compose.foundation.text.BasicTextField
 import com.arick.androidlocalllmlab.ui.theme.AppColors
 import com.arick.androidlocalllmlab.ui.theme.AndroidLocalLlmLabTheme
 import kotlinx.coroutines.launch
+import java.util.Locale
+import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity() {
     private val chatViewModel: ChatViewModel by viewModels()
@@ -86,6 +92,11 @@ private fun ChatScreen(viewModel: ChatViewModel) {
     val promptTokenCount by viewModel.promptTokenCount.collectAsState()
     val trimmedHistoryTurnCount by viewModel.trimmedHistoryTurnCount.collectAsState()
     val requestedNctx by viewModel.requestedNctx.collectAsState()
+    val cpuThreads by viewModel.cpuThreads.collectAsState()
+    val inferenceConfig by viewModel.inferenceConfig.collectAsState()
+    val thinkingEnabled by viewModel.thinkingEnabled.collectAsState()
+    val generationProgress by viewModel.generationProgress.collectAsState()
+    val generationMetrics by viewModel.generationMetrics.collectAsState()
     val isGenerating by viewModel.isGenerating.collectAsState()
     val isStopRequested by viewModel.isStopRequested.collectAsState()
     val generationError by viewModel.generationError.collectAsState()
@@ -103,6 +114,11 @@ private fun ChatScreen(viewModel: ChatViewModel) {
 
     val isPreparing = uiState is ChatUiState.Preparing
     val isModelReady = uiState is ChatUiState.Ready
+    val supportsQwen3ThinkingSwitch = (uiState as? ChatUiState.Ready)?.let { state ->
+        val identity = "${state.modelName} ${state.modelDescription}"
+        identity.contains("qwen3", ignoreCase = true) &&
+                !identity.contains("instruct-2507", ignoreCase = true)
+    } == true
 
     // 设置页是当前 Composable 的内部页面状态，不在 Android Navigation 返回栈中。
     // 因此需要显式消费系统返回，优先回到聊天页而不是退出整个 App。
@@ -118,9 +134,17 @@ private fun ChatScreen(viewModel: ChatViewModel) {
             trimmedHistoryTurnCount = trimmedHistoryTurnCount,
             nCtx = (uiState as? ChatUiState.Ready)?.nCtx,
             requestedNctx = requestedNctx,
+            cpuThreads = cpuThreads,
+            inferenceConfig = inferenceConfig,
+            supportsQwen3ThinkingSwitch = supportsQwen3ThinkingSwitch,
+            thinkingEnabled = thinkingEnabled,
+            generationMetrics = generationMetrics,
             isGenerating = isGenerating,
             onSystemPromptChange = viewModel::updateSystemPrompt,
             onContextWindowChange = viewModel::updateContextWindow,
+            onCpuThreadsChange = viewModel::updateCpuThreads,
+            onInferenceConfigChange = viewModel::updateInferenceConfig,
+            onThinkingEnabledChange = viewModel::updateThinkingEnabled,
             onClearConversation = viewModel::clearConversation,
             onResetContext = viewModel::resetContext,
             onSelectModel = {
@@ -195,6 +219,7 @@ private fun ChatScreen(viewModel: ChatViewModel) {
                             messages = messages,
                             isGenerating = isGenerating,
                             isStopRequested = isStopRequested,
+                            generationProgress = generationProgress,
                             errorMessage = generationError
                         )
 
@@ -362,6 +387,7 @@ private fun ChatContent(
     messages: List<ChatMessage>,
     isGenerating: Boolean,
     isStopRequested: Boolean,
+    generationProgress: String?,
     errorMessage: String?
 ) {
     Column(
@@ -370,13 +396,13 @@ private fun ChatContent(
             .verticalScroll(rememberScrollState())
             .padding(horizontal = 18.dp, vertical = 12.dp)
     ) {
-        messages.filter { it.content.isNotBlank() }.forEach { message ->
+        messages.filter { it.content.isNotBlank() || it.reasoningContent.isNotBlank() }.forEach { message ->
             ChatMessageItem(message)
         }
 
         if (isGenerating) {
             Text(
-                text = if (isStopRequested) "正在停止…" else "正在生成…",
+                text = if (isStopRequested) "正在停止…" else generationProgress ?: "正在生成…",
                 modifier = Modifier.padding(top = 20.dp),
                 color = AppColors.TextTertiary,
                 fontSize = 12.sp
@@ -419,11 +445,53 @@ private fun ChatMessageItem(message: ChatMessage) {
                 )
             }
         } else {
-            Text(
-                text = message.content,
-                color = AppColors.TextPrimary,
-                fontSize = 16.sp
-            )
+            if (message.reasoningContent.isNotBlank()) {
+                var isThinkingExpanded by remember(message.reasoningContent) { mutableStateOf(true) }
+                Surface(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { isThinkingExpanded = !isThinkingExpanded },
+                    shape = RoundedCornerShape(12.dp),
+                    color = AppColors.SettingsBackground
+                ) {
+                    Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                text = "思考过程",
+                                modifier = Modifier.weight(1f),
+                                color = AppColors.TextTertiary,
+                                fontSize = 12.sp
+                            )
+                            Icon(
+                                imageVector = if (isThinkingExpanded) {
+                                    Icons.Default.KeyboardArrowUp
+                                } else {
+                                    Icons.Default.KeyboardArrowDown
+                                },
+                                contentDescription = if (isThinkingExpanded) "折叠思考过程" else "展开思考过程",
+                                tint = AppColors.TextHint,
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
+                        if (isThinkingExpanded) {
+                            Text(
+                                text = message.reasoningContent,
+                                modifier = Modifier.padding(top = 6.dp),
+                                color = AppColors.TextSecondary,
+                                fontSize = 12.sp
+                            )
+                        }
+                    }
+                }
+            }
+            if (message.content.isNotBlank()) {
+                Text(
+                    text = message.content,
+                    modifier = Modifier.padding(top = if (message.reasoningContent.isBlank()) 0.dp else 10.dp),
+                    color = AppColors.TextPrimary,
+                    fontSize = 16.sp
+                )
+            }
         }
     }
 }
@@ -466,9 +534,17 @@ private fun ConversationSettingsScreen(
     trimmedHistoryTurnCount: Int,
     nCtx: Int?,
     requestedNctx: Int,
+    cpuThreads: Int,
+    inferenceConfig: InferenceConfig,
+    supportsQwen3ThinkingSwitch: Boolean,
+    thinkingEnabled: Boolean,
+    generationMetrics: GenerationMetrics?,
     isGenerating: Boolean,
     onSystemPromptChange: (String) -> Unit,
     onContextWindowChange: (Int) -> Unit,
+    onCpuThreadsChange: (Int) -> Unit,
+    onInferenceConfigChange: (InferenceConfig) -> Unit,
+    onThinkingEnabledChange: (Boolean) -> Unit,
     onClearConversation: () -> Unit,
     onResetContext: () -> Unit,
     onSelectModel: () -> Unit,
@@ -478,11 +554,14 @@ private fun ConversationSettingsScreen(
     var isSystemPromptDialogVisible by remember { mutableStateOf(false) }
     var isFinalPromptDialogVisible by remember { mutableStateOf(false) }
     var isContextWindowDialogVisible by remember { mutableStateOf(false) }
+    var isCpuThreadsDialogVisible by remember { mutableStateOf(false) }
+    var isSamplingDialogVisible by remember { mutableStateOf(false) }
     var isClearConversationDialogVisible by remember { mutableStateOf(false) }
     var isResetContextDialogVisible by remember { mutableStateOf(false) }
     var isReleaseModelDialogVisible by remember { mutableStateOf(false) }
     var systemPromptDraft by remember { mutableStateOf(systemPrompt) }
     var contextWindowDraft by remember { mutableStateOf(requestedNctx) }
+    var samplingDraft by remember { mutableStateOf(inferenceConfig) }
 
     Scaffold(
         containerColor = AppColors.SettingsBackground,
@@ -555,6 +634,36 @@ private fun ConversationSettingsScreen(
                     }
                 )
                 SettingsRow(
+                    title = "CPU 线程",
+                    summary = "$cpuThreads 线程",
+                    enabled = !isGenerating && nCtx != null,
+                    onClick = { isCpuThreadsDialogVisible = true }
+                )
+                SettingsSwitchRow(
+                    title = "Qwen3 思考",
+                    summary = if (supportsQwen3ThinkingSwitch) {
+                        "开启后先生成推理过程"
+                    } else {
+                        "当前模型固定非思考"
+                    },
+                    checked = thinkingEnabled,
+                    enabled = !isGenerating && supportsQwen3ThinkingSwitch,
+                    onCheckedChange = onThinkingEnabledChange
+                )
+                SettingsRow(
+                    title = "采样参数",
+                    summary = if (inferenceConfig.isGreedy) {
+                        "稳定 · ${inferenceConfig.maxTokens} tokens"
+                    } else {
+                        "采样 · ${inferenceConfig.maxTokens} tokens"
+                    },
+                    enabled = !isGenerating && nCtx != null,
+                    onClick = {
+                        samplingDraft = inferenceConfig
+                        isSamplingDialogVisible = true
+                    }
+                )
+                SettingsRow(
                     title = "上下文占用",
                     // Native 回调的 token 数包含 Chat Template 和特殊 Token，
                     // 即本轮真正 Prefill 到 Context 中的 Prompt 占用。
@@ -583,6 +692,49 @@ private fun ConversationSettingsScreen(
                     summary = "清空 KV Cache",
                     enabled = !isGenerating && nCtx != null,
                     onClick = { isResetContextDialogVisible = true }
+                )
+            }
+
+            SettingsSection(
+                title = "性能",
+                modifier = Modifier.padding(top = 28.dp)
+            ) {
+                SettingsRow(
+                    title = "首 Token 等待",
+                    summary = generationMetrics?.firstTokenMillis?.let { "$it ms" } ?: "暂无",
+                    showChevron = false,
+                    clickable = false,
+                    onClick = {}
+                )
+                SettingsRow(
+                    title = "Prefill",
+                    summary = generationMetrics?.prefillMillis?.let { "$it ms" } ?: "暂无",
+                    showChevron = false,
+                    clickable = false,
+                    onClick = {}
+                )
+                SettingsRow(
+                    title = "Decode",
+                    summary = generationMetrics?.let {
+                        "${formatTokensPerSecond(it.decodeTokensPerSecond)} tok/s"
+                    } ?: "暂无",
+                    showChevron = false,
+                    clickable = false,
+                    onClick = {}
+                )
+                SettingsRow(
+                    title = "本轮生成",
+                    summary = generationMetrics?.generatedTokenCount?.let { "$it tokens" } ?: "暂无",
+                    showChevron = false,
+                    clickable = false,
+                    onClick = {}
+                )
+                SettingsRow(
+                    title = "本轮总耗时",
+                    summary = generationMetrics?.totalMillis?.let { "$it ms" } ?: "暂无",
+                    showChevron = false,
+                    clickable = false,
+                    onClick = {}
                 )
             }
 
@@ -716,6 +868,117 @@ private fun ConversationSettingsScreen(
         )
     }
 
+    if (isCpuThreadsDialogVisible) {
+        AlertDialog(
+            onDismissRequest = { isCpuThreadsDialogVisible = false },
+            containerColor = AppColors.Surface,
+            title = { Text("CPU 线程", fontSize = 16.sp) },
+            text = {
+                Column {
+                    Text(
+                        text = "同时影响 Prompt 的 Prefill 和逐 Token Decode。线程更多不一定更快，请用性能数据对照。",
+                        color = AppColors.TextTertiary,
+                        fontSize = 12.sp
+                    )
+                    listOf(1, 2, 4, 6, 8).forEach { option ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    onCpuThreadsChange(option)
+                                    isCpuThreadsDialogVisible = false
+                                }
+                                .padding(top = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            RadioButton(
+                                selected = cpuThreads == option,
+                                onClick = {
+                                    onCpuThreadsChange(option)
+                                    isCpuThreadsDialogVisible = false
+                                }
+                            )
+                            Text(
+                                text = "$option 线程",
+                                modifier = Modifier.padding(start = 8.dp),
+                                fontSize = 14.sp
+                            )
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { isCpuThreadsDialogVisible = false }) {
+                    Text("关闭")
+                }
+            }
+        )
+    }
+
+    if (isSamplingDialogVisible) {
+        AlertDialog(
+            onDismissRequest = { isSamplingDialogVisible = false },
+            containerColor = AppColors.Surface,
+            title = { Text("采样参数", fontSize = 16.sp) },
+            text = {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(390.dp)
+                        .verticalScroll(rememberScrollState())
+                ) {
+                    Text(
+                        text = "Temperature 为 0 时使用稳定的 greedy 模式；此时 Top-K、Top-P、Min-P、Repeat Penalty 与 Seed 不参与选词。",
+                        color = AppColors.TextTertiary,
+                        fontSize = 12.sp
+                    )
+                    SamplingSlider("Temperature", listOf("0（稳定）" to 0f, "0.2" to 0.2f, "0.7" to 0.7f, "1.0" to 1.0f), samplingDraft.temperature) {
+                        samplingDraft = samplingDraft.copy(temperature = it)
+                    }
+                    SamplingSlider("Top-K", listOf("20" to 20, "40" to 40, "80" to 80, "不限制" to 0), samplingDraft.topK) {
+                        samplingDraft = samplingDraft.copy(topK = it)
+                    }
+                    SamplingSlider("Top-P", listOf("0.8" to 0.8f, "0.9" to 0.9f, "0.95" to 0.95f, "1.0" to 1.0f), samplingDraft.topP) {
+                        samplingDraft = samplingDraft.copy(topP = it)
+                    }
+                    SamplingSlider("Min-P", listOf("0" to 0f, "0.05" to 0.05f, "0.1" to 0.1f), samplingDraft.minP) {
+                        samplingDraft = samplingDraft.copy(minP = it)
+                    }
+                    SamplingSlider("Repeat Penalty", listOf("1.0" to 1.0f, "1.05" to 1.05f, "1.1" to 1.1f, "1.2" to 1.2f), samplingDraft.repeatPenalty) {
+                        samplingDraft = samplingDraft.copy(repeatPenalty = it)
+                    }
+                    SamplingSlider("Seed", listOf("42" to 42, "2026" to 2026, "随机" to -1), samplingDraft.seed) {
+                        samplingDraft = samplingDraft.copy(seed = it)
+                    }
+                    SamplingSlider(
+                        title = "Max Tokens",
+                        options = listOf(64, 128, 256, 512)
+                            .filter { it < (nCtx ?: requestedNctx) }
+                            .map { "$it" to it },
+                        selected = samplingDraft.maxTokens
+                    ) {
+                        samplingDraft = samplingDraft.copy(maxTokens = it)
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        onInferenceConfigChange(samplingDraft)
+                        isSamplingDialogVisible = false
+                    }
+                ) {
+                    Text("保存")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { isSamplingDialogVisible = false }) {
+                    Text("取消")
+                }
+            }
+        )
+    }
+
     if (isClearConversationDialogVisible) {
         ConfirmActionDialog(
             title = "清空聊天消息？",
@@ -757,6 +1020,42 @@ private fun ConversationSettingsScreen(
 }
 
 @Composable
+private fun <T> SamplingSlider(
+    title: String,
+    options: List<Pair<String, T>>,
+    selected: T,
+    onSelect: (T) -> Unit
+) {
+    val selectedIndex = options.indexOfFirst { (_, value) -> value == selected }
+        .coerceAtLeast(0)
+    val currentLabel = options[selectedIndex].first
+
+    Column(modifier = Modifier.padding(top = 14.dp)) {
+        Row(modifier = Modifier.fillMaxWidth()) {
+            Text(
+                text = title,
+                modifier = Modifier.weight(1f),
+                color = AppColors.TextSecondary,
+                fontSize = 14.sp
+            )
+            Text(
+                text = currentLabel,
+                color = AppColors.TextHint,
+                fontSize = 14.sp
+            )
+        }
+        Slider(
+            value = selectedIndex.toFloat(),
+            onValueChange = { position -> onSelect(options[position.roundToInt()].second) },
+            valueRange = 0f..(options.lastIndex.toFloat()),
+            // 不显示 Material 默认的离散刻度线；值仍会在 onValueChange 时吸附到预设档位。
+            steps = 0,
+            modifier = Modifier.fillMaxWidth()
+        )
+    }
+}
+
+@Composable
 private fun ConfirmActionDialog(
     title: String,
     message: String,
@@ -787,6 +1086,9 @@ private fun ConfirmActionDialog(
         }
     )
 }
+
+private fun formatTokensPerSecond(value: Double): String =
+    String.format(Locale.US, "%.1f", value)
 
 @Composable
 private fun SettingsSection(
@@ -861,6 +1163,42 @@ private fun SettingsRow(
                 lineHeight = 22.sp
             )
         }
+    }
+}
+
+@Composable
+private fun SettingsSwitchRow(
+    title: String,
+    summary: String,
+    checked: Boolean,
+    enabled: Boolean,
+    onCheckedChange: (Boolean) -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(enabled = enabled) { onCheckedChange(!checked) }
+            .padding(horizontal = 20.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = title,
+                color = if (enabled) AppColors.TextPrimary else AppColors.TextDisabled,
+                fontSize = 16.sp
+            )
+            Text(
+                text = summary,
+                modifier = Modifier.padding(top = 2.dp),
+                color = AppColors.TextHint,
+                fontSize = 12.sp
+            )
+        }
+        Switch(
+            checked = checked,
+            enabled = enabled,
+            onCheckedChange = onCheckedChange
+        )
     }
 }
 
