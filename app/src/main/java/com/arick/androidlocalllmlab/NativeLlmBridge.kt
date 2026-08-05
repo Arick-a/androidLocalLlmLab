@@ -1,7 +1,7 @@
 package com.arick.androidlocalllmlab
 
 interface NativeGenerationCallback {
-    fun onPrompt(prompt: String)
+    fun onPrompt(prompt: String, tokenCount: Int)
 
     fun onToken(piece: String)
 }

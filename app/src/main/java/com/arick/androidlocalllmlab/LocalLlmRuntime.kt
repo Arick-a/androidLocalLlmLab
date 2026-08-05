@@ -81,6 +81,15 @@ class LocalLlmRuntime : AutoCloseable {
         return actualNctx
     }
 
+    fun recreateContext(requestedNctx: Int): Int {
+        check(nativeHandle != 0L) { "Runtime has not been created" }
+        check(requestedNctx > 0) { "n_ctx must be positive" }
+
+        // 只重建推理现场：模型权重仍留在 Native 内存中，旧 KV Cache 会随 Context 释放。
+        releaseContext()
+        return createContext(requestedNctx)
+    }
+
     fun tokenize(text: String): IntArray {
         check(nativeHandle != 0L) { "Runtime has not been created" }
 
@@ -112,7 +121,7 @@ class LocalLlmRuntime : AutoCloseable {
     fun generate(
         messages: List<ChatMessage>,
         maxTokens: Int,
-        onPrompt: (String) -> Unit,
+        onPrompt: (String, Int) -> Unit,
         onToken: (String) -> Unit
     ): String {
         check(nativeHandle != 0L) { "Runtime has not been created" }
@@ -131,7 +140,8 @@ class LocalLlmRuntime : AutoCloseable {
             contents = messages.map(ChatMessage::content).toTypedArray(),
             maxTokens = maxTokens,
             generationCallback = object : NativeGenerationCallback {
-                override fun onPrompt(prompt: String) = onPrompt(prompt)
+                override fun onPrompt(prompt: String, tokenCount: Int) =
+                    onPrompt(prompt, tokenCount)
 
                 override fun onToken(piece: String) = onToken(piece)
             }

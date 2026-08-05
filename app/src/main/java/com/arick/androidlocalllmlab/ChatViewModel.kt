@@ -61,6 +61,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val _finalPrompt = MutableStateFlow("")
     val finalPrompt: StateFlow<String> = _finalPrompt.asStateFlow()
 
+    private val _promptTokenCount = MutableStateFlow(0)
+    val promptTokenCount: StateFlow<Int> = _promptTokenCount.asStateFlow()
+
+    private val _requestedNctx = MutableStateFlow(2048)
+    val requestedNctx: StateFlow<Int> = _requestedNctx.asStateFlow()
+
     private val _isGenerating = MutableStateFlow(false)
     val isGenerating: StateFlow<Boolean> = _isGenerating.asStateFlow()
 
@@ -122,13 +128,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             // Native 模型加载与 Context 分配可能耗时，不能阻塞 Compose 主线程。
             runtime.prepareModel(
                 modelPath = modelFile.absolutePath,
-                requestedNctx = 2048
+                requestedNctx = _requestedNctx.value
             )
         }
 
         check(actualNctx > 0) { "模型或 Context 创建失败" }
         _messages.value = emptyList()
         _finalPrompt.value = ""
+        _promptTokenCount.value = 0
         _generationError.value = null
         _uiState.value = ChatUiState.Ready(modelFile, actualNctx)
     }
@@ -160,6 +167,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         )
         _generationError.value = null
         _finalPrompt.value = ""
+        _promptTokenCount.value = 0
         // 必须在启动协程前清除上次的停止标记，否则下一轮会立即被旧请求取消。
         runtime.resetStopRequest()
         _isStopRequested.value = false
@@ -171,8 +179,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     runtime.generate(
                         messages = historyForNative,
                         maxTokens = 128,
-                        onPrompt = { finalPrompt ->
+                        onPrompt = { finalPrompt, tokenCount ->
                             _finalPrompt.value = finalPrompt
+                            _promptTokenCount.value = tokenCount
                         }
                     ) { piece ->
                         val currentMessages = _messages.value
@@ -200,6 +209,39 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun updateSystemPrompt(value: String) {
         if (!_isGenerating.value) {
             _systemPrompt.value = value
+        }
+    }
+
+    fun updateContextWindow(requestedNctx: Int) {
+        if (requestedNctx <= 0 || _isGenerating.value || _uiState.value is ChatUiState.Preparing) {
+            return
+        }
+
+        val currentState = _uiState.value as? ChatUiState.Ready
+        if (currentState == null) {
+            // 还未加载模型时只记录选择；下次加载模型时会使用它创建 Context。
+            _requestedNctx.value = requestedNctx
+            return
+        }
+        if (currentState.nCtx == requestedNctx) {
+            return
+        }
+
+        viewModelScope.launch {
+            try {
+                _uiState.value = ChatUiState.Preparing("正在重建 Context…")
+                val actualNctx = withContext(Dispatchers.Default) {
+                    runtime.recreateContext(requestedNctx)
+                }
+                check(actualNctx > 0) { "Context 创建失败" }
+
+                _requestedNctx.value = requestedNctx
+                _uiState.value = ChatUiState.Ready(currentState.modelFile, actualNctx)
+            } catch (error: Throwable) {
+                _uiState.value = ChatUiState.Error(
+                    error.message ?: "Context 重建失败"
+                )
+            }
         }
     }
 

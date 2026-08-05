@@ -196,7 +196,7 @@ namespace {
         std::string generate(
                 const std::vector<ChatMessage> &history,
                 int maxTokens,
-                const std::function<bool(const std::string &)> &onPrompt,
+                const std::function<bool(const std::string &, int)> &onPrompt,
                 const std::function<bool(const std::string &)> &onToken
         ) {
             if (model_ == nullptr || context_ == nullptr || history.empty() || maxTokens <= 0) {
@@ -269,13 +269,13 @@ namespace {
                     static_cast<size_t>(promptLength)
             );
 
-            // 这是 Chat Template 已经应用后的真实 prompt，而不是 Kotlin 侧手工拼接的
-            // 近似值。先回调给 UI，便于观察 system/history 如何改变模型输入。
-            if (!onPrompt(prompt)) {
+            const std::vector<llama_token> promptTokens = tokenize(prompt, true);
+            // Token 数由当前 GGUF 的 tokenizer 得到，因此包含模型模板标记与特殊 Token。
+            // 它才是这轮 Prompt 占用 Context 的真实计量，而不是中文字符数。
+            if (!onPrompt(prompt, static_cast<int>(promptTokens.size()))) {
                 return {};
             }
 
-            const std::vector<llama_token> promptTokens = tokenize(prompt, true);
             if (prefill(promptTokens) != static_cast<int>(promptTokens.size())) {
                 return {};
             }
@@ -702,7 +702,7 @@ Java_com_arick_androidlocalllmlab_NativeLlmBridge_nativeGenerate(
     jclass callbackClass = env->GetObjectClass(generationCallback);
     jmethodID onPromptMethod = callbackClass == nullptr
             ? nullptr
-            : env->GetMethodID(callbackClass, "onPrompt", "(Ljava/lang/String;)V");
+            : env->GetMethodID(callbackClass, "onPrompt", "(Ljava/lang/String;I)V");
     jmethodID onTokenMethod = callbackClass == nullptr
             ? nullptr
             : env->GetMethodID(callbackClass, "onToken", "(Ljava/lang/String;)V");
@@ -714,13 +714,18 @@ Java_com_arick_androidlocalllmlab_NativeLlmBridge_nativeGenerate(
     const std::string answer = runtime->generate(
             history,
             maxTokens,
-            [env, generationCallback, onPromptMethod](const std::string &prompt) {
+            [env, generationCallback, onPromptMethod](const std::string &prompt, int tokenCount) {
                 jstring kotlinPrompt = env->NewStringUTF(prompt.c_str());
                 if (kotlinPrompt == nullptr) {
                     return false;
                 }
 
-                env->CallVoidMethod(generationCallback, onPromptMethod, kotlinPrompt);
+                env->CallVoidMethod(
+                        generationCallback,
+                        onPromptMethod,
+                        kotlinPrompt,
+                        static_cast<jint>(tokenCount)
+                );
                 env->DeleteLocalRef(kotlinPrompt);
 
                 if (env->ExceptionCheck()) {
