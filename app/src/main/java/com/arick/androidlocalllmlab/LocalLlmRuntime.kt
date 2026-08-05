@@ -42,6 +42,17 @@ class LocalLlmRuntime : AutoCloseable {
         NativeLlmBridge.nativeReleaseContext(nativeHandle)
     }
 
+    fun requestStop() {
+        if (nativeHandle != 0L) {
+            NativeLlmBridge.nativeRequestStop(nativeHandle)
+        }
+    }
+
+    fun resetStopRequest() {
+        check(nativeHandle != 0L) { "Runtime has not been created" }
+        NativeLlmBridge.nativeResetStopRequest(nativeHandle)
+    }
+
     fun createIfNeeded() {
         if (nativeHandle == 0L) {
             nativeHandle = NativeLlmBridge.nativeCreateRuntime()
@@ -98,14 +109,32 @@ class LocalLlmRuntime : AutoCloseable {
         return NativeLlmBridge.nativeTokenToPiece(nativeHandle, tokenId)
     }
 
-    fun generate(prompt: String, maxTokens: Int): String {
+    fun generate(
+        messages: List<ChatMessage>,
+        maxTokens: Int,
+        onPrompt: (String) -> Unit,
+        onToken: (String) -> Unit
+    ): String {
         check(nativeHandle != 0L) { "Runtime has not been created" }
+        check(messages.isNotEmpty()) { "messages must not be empty" }
         check(maxTokens > 0) { "maxTokens must be positive" }
 
         return NativeLlmBridge.nativeGenerate(
             handle = nativeHandle,
-            prompt = prompt,
-            maxTokens = maxTokens
+            roles = messages.map { message ->
+                when (message.role) {
+                    MessageRole.System -> "system"
+                    MessageRole.User -> "user"
+                    MessageRole.Assistant -> "assistant"
+                }
+            }.toTypedArray(),
+            contents = messages.map(ChatMessage::content).toTypedArray(),
+            maxTokens = maxTokens,
+            generationCallback = object : NativeGenerationCallback {
+                override fun onPrompt(prompt: String) = onPrompt(prompt)
+
+                override fun onToken(piece: String) = onToken(piece)
+            }
         )
     }
 }

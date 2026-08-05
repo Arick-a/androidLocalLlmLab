@@ -31,6 +31,7 @@ sealed interface ChatUiState {
 }
 
 enum class MessageRole {
+    System,
     User,
     Assistant
 }
@@ -52,8 +53,19 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val _messages = MutableStateFlow<List<ChatMessage>>(emptyList())
     val messages: StateFlow<List<ChatMessage>> = _messages.asStateFlow()
 
+    // System Prompt 是当前会话配置，不作为普通聊天气泡渲染。
+    private val _systemPrompt = MutableStateFlow("")
+    val systemPrompt: StateFlow<String> = _systemPrompt.asStateFlow()
+
+    // 由 Native 在应用 Chat Template 后回调，反映模型真正收到的文本。
+    private val _finalPrompt = MutableStateFlow("")
+    val finalPrompt: StateFlow<String> = _finalPrompt.asStateFlow()
+
     private val _isGenerating = MutableStateFlow(false)
     val isGenerating: StateFlow<Boolean> = _isGenerating.asStateFlow()
+
+    private val _isStopRequested = MutableStateFlow(false)
+    val isStopRequested: StateFlow<Boolean> = _isStopRequested.asStateFlow()
 
     private val _generationError = MutableStateFlow<String?>(null)
     val generationError: StateFlow<String?> = _generationError.asStateFlow()
@@ -116,6 +128,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
         check(actualNctx > 0) { "模型或 Context 创建失败" }
         _messages.value = emptyList()
+        _finalPrompt.value = ""
         _generationError.value = null
         _uiState.value = ChatUiState.Ready(modelFile, actualNctx)
     }
@@ -129,24 +142,76 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
-        // 当前先完成单轮问答：每次发送都用这一句作为全新 prompt，不携带历史消息。
-        _messages.value = listOf(ChatMessage(MessageRole.User, prompt))
+        // 消息历史是产品数据源；当前轮的空 AI 消息只用于接收流式输出，
+        // 因而不会传给 Native 作为 prompt 的一部分。
+        val visibleHistory = _messages.value.filter { it.content.isNotBlank() }
+        val historyForNative = buildList {
+            _systemPrompt.value.trim().takeIf { it.isNotEmpty() }?.let { systemPrompt ->
+                add(ChatMessage(MessageRole.System, systemPrompt))
+            }
+            addAll(visibleHistory)
+            add(ChatMessage(MessageRole.User, prompt))
+        }
+        _messages.value = visibleHistory + ChatMessage(
+            MessageRole.User,
+            prompt
+        ) + listOf(
+            ChatMessage(MessageRole.Assistant, "")
+        )
         _generationError.value = null
+        _finalPrompt.value = ""
+        // 必须在启动协程前清除上次的停止标记，否则下一轮会立即被旧请求取消。
+        runtime.resetStopRequest()
+        _isStopRequested.value = false
         _isGenerating.value = true
 
         viewModelScope.launch {
             try {
                 val answer = withContext(Dispatchers.Default) {
-                    runtime.generate(prompt, maxTokens = 128)
+                    runtime.generate(
+                        messages = historyForNative,
+                        maxTokens = 128,
+                        onPrompt = { finalPrompt ->
+                            _finalPrompt.value = finalPrompt
+                        }
+                    ) { piece ->
+                        val currentMessages = _messages.value
+                        _messages.value = currentMessages.mapIndexed { index, message ->
+                            if (index == currentMessages.lastIndex) {
+                                message.copy(content = message.content + piece)
+                            } else {
+                                message
+                            }
+                        }
+                    }
                 }
-                check(answer.isNotBlank()) { "模型没有返回内容" }
-                _messages.value = _messages.value + ChatMessage(MessageRole.Assistant, answer)
+                if (answer.isBlank() && !_isStopRequested.value) {
+                    error("模型没有返回内容")
+                }
             } catch (error: Throwable) {
                 _generationError.value = error.message ?: "生成失败"
             } finally {
                 _isGenerating.value = false
+                _isStopRequested.value = false
             }
         }
+    }
+
+    fun updateSystemPrompt(value: String) {
+        if (!_isGenerating.value) {
+            _systemPrompt.value = value
+        }
+    }
+
+    fun stopGenerating() {
+        if (!_isGenerating.value || _isStopRequested.value) {
+            return
+        }
+
+        _isStopRequested.value = true
+        // 不能只取消协程：llama.cpp 此时仍在 C++ 循环中。这里通过 JNI 写入
+        // Native atomic 标记，由 generate() 在下一个安全边界自行退出。
+        runtime.requestStop()
     }
 
     fun releaseModel() {

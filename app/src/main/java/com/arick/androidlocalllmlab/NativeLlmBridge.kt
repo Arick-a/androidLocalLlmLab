@@ -1,5 +1,11 @@
 package com.arick.androidlocalllmlab
 
+interface NativeGenerationCallback {
+    fun onPrompt(prompt: String)
+
+    fun onToken(piece: String)
+}
+
 object NativeLlmBridge {
     init {
         System.loadLibrary("native_llm")
@@ -23,6 +29,10 @@ object NativeLlmBridge {
 
     external fun nativeReleaseContext(handle: Long)
 
+    external fun nativeRequestStop(handle: Long)
+
+    external fun nativeResetStopRequest(handle: Long)
+
     external fun nativeTokenize(
         handle: Long,
         text: String
@@ -42,7 +52,9 @@ object NativeLlmBridge {
 
     external fun nativeGenerate(
         handle: Long,
-        prompt: String,
-        maxTokens: Int
+        roles: Array<String>,
+        contents: Array<String>,
+        maxTokens: Int,
+        generationCallback: NativeGenerationCallback
     ): String
 }

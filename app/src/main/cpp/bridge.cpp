@@ -1,5 +1,8 @@
 #include <jni.h>
 #include <android/log.h>
+#include <algorithm>
+#include <atomic>
+#include <functional>
 #include <string>
 #include <vector>
 #include "llama.h"
@@ -7,6 +10,11 @@
 namespace {
 
     constexpr char kLogTag[] = "NativeLlm";
+
+    struct ChatMessage {
+        std::string role;
+        std::string content;
+    };
 
     class NativeRuntime {
     public:
@@ -82,6 +90,14 @@ namespace {
             nextPosition_ = 0;
         }
 
+        void requestStop() {
+            stopRequested_.store(true);
+        }
+
+        void resetStopRequest() {
+            stopRequested_.store(false);
+        }
+
         std::vector<llama_token> tokenize(
                 const std::string &text,
                 bool parseSpecial = false
@@ -135,57 +151,94 @@ namespace {
                 return 0;
             }
 
-            // 当前实验一次最多提交 n_batch 个 Token。
-            if (tokens.size() > llama_n_batch(context_)) {
+            if (tokens.size() > llama_n_ctx(context_)) {
                 return 0;
             }
 
-            // 本实验每次都是一段全新的固定文本，因此先清除旧 KV Cache。
+            // 基础多轮版每次都用完整历史重建 prompt，因此旧 KV Cache 不能复用。
             llama_memory_clear(llama_get_memory(context_), false);
 
-            llama_batch batch = llama_batch_init(
-                    static_cast<int32_t>(tokens.size()),
-                    0,
-                    1
-            );
+            // n_batch 是单次 llama_decode 的上限，不是整个 prompt 的上限。
+            // 历史消息可能超过 512 Token，因此分批 Prefill，但 position 必须连续。
+            const size_t batchSize = llama_n_batch(context_);
+            for (size_t start = 0; start < tokens.size(); start += batchSize) {
+                if (stopRequested_.load()) {
+                    return 0;
+                }
 
-            for (size_t index = 0; index < tokens.size(); ++index) {
-                batch.token[index] = tokens[index];
-                batch.pos[index] = static_cast<llama_pos>(index);
-                batch.n_seq_id[index] = 1;
-                batch.seq_id[index][0] = 0;
+                const size_t count = std::min(batchSize, tokens.size() - start);
+                llama_batch batch = llama_batch_init(static_cast<int32_t>(count), 0, 1);
 
-                // 只有最后一个 Token 需要 Logits。
-                // 下一步 Sampling 会从这行 Logits 中选择下一个 Token。
-                batch.logits[index] = index == tokens.size() - 1;
-            }
+                for (size_t offset = 0; offset < count; ++offset) {
+                    const size_t index = start + offset;
+                    batch.token[offset] = tokens[index];
+                    batch.pos[offset] = static_cast<llama_pos>(index);
+                    batch.n_seq_id[offset] = 1;
+                    batch.seq_id[offset][0] = 0;
 
-            batch.n_tokens = static_cast<int32_t>(tokens.size());
+                    // 只有完整 prompt 的最后一个 Token 需要 Logits。
+                    batch.logits[offset] = index == tokens.size() - 1;
+                }
 
-            const int32_t decodeResult = llama_decode(context_, batch);
-            llama_batch_free(batch);
+                batch.n_tokens = static_cast<int32_t>(count);
+                const int32_t decodeResult = llama_decode(context_, batch);
+                llama_batch_free(batch);
 
-            if (decodeResult != 0) {
-                return 0;
+                if (decodeResult != 0) {
+                    return 0;
+                }
             }
 
             nextPosition_ = static_cast<llama_pos>(tokens.size());
             return static_cast<int>(tokens.size());
         }
 
-        std::string generate(const std::string &userPrompt, int maxTokens) {
-            if (model_ == nullptr || context_ == nullptr || userPrompt.empty() || maxTokens <= 0) {
+        std::string generate(
+                const std::vector<ChatMessage> &history,
+                int maxTokens,
+                const std::function<bool(const std::string &)> &onPrompt,
+                const std::function<bool(const std::string &)> &onToken
+        ) {
+            if (model_ == nullptr || context_ == nullptr || history.empty() || maxTokens <= 0) {
                 return {};
             }
 
-            // Qwen2.5 Instruct 的 GGUF 带有 ChatML 模板；nullptr 会让 llama.cpp 使用
-            // 模型默认模板。addAssistant=true 表示结尾追加 assistant 的回复起始标记。
-            const llama_chat_message message = {"user", userPrompt.c_str()};
-            std::vector<char> formattedPrompt(userPrompt.size() + 128);
+            if (stopRequested_.load()) {
+                return {};
+            }
+
+            // 模板来自当前 GGUF 的 tokenizer.chat_template 元数据，而不是写死 Qwen 的
+            // ChatML。不同 Instruct 模型（Qwen、Llama、Mistral 等）可以各自决定
+            // user / assistant 消息应如何组织。
+            const char *chatTemplate = llama_model_chat_template(model_, nullptr);
+            if (chatTemplate == nullptr) {
+                __android_log_print(
+                        ANDROID_LOG_WARN,
+                        kLogTag,
+                        "The loaded GGUF has no chat template"
+                );
+                return {};
+            }
+
+            // 保持字符串所有权，再创建 llama.cpp 所需的 role/content 指针数组。
+            // 这样每轮都能把 user 与 assistant 的完整历史交给同一个模型模板。
+            std::vector<llama_chat_message> messages;
+            messages.reserve(history.size());
+            size_t totalCharacters = 0;
+            for (const ChatMessage &message : history) {
+                if (message.role.empty() || message.content.empty()) {
+                    return {};
+                }
+                messages.push_back({message.role.c_str(), message.content.c_str()});
+                totalCharacters += message.role.size() + message.content.size();
+            }
+
+            // addAssistant=true 表示结尾追加 assistant 的回复起始标记。
+            std::vector<char> formattedPrompt(totalCharacters * 2 + 128);
             int32_t promptLength = llama_chat_apply_template(
-                    nullptr,
-                    &message,
-                    1,
+                    chatTemplate,
+                    messages.data(),
+                    messages.size(),
                     true,
                     formattedPrompt.data(),
                     static_cast<int32_t>(formattedPrompt.size())
@@ -198,9 +251,9 @@ namespace {
             if (promptLength > static_cast<int32_t>(formattedPrompt.size())) {
                 formattedPrompt.resize(static_cast<size_t>(promptLength));
                 promptLength = llama_chat_apply_template(
-                        nullptr,
-                        &message,
-                        1,
+                        chatTemplate,
+                        messages.data(),
+                        messages.size(),
                         true,
                         formattedPrompt.data(),
                         static_cast<int32_t>(formattedPrompt.size())
@@ -215,8 +268,19 @@ namespace {
                     formattedPrompt.data(),
                     static_cast<size_t>(promptLength)
             );
+
+            // 这是 Chat Template 已经应用后的真实 prompt，而不是 Kotlin 侧手工拼接的
+            // 近似值。先回调给 UI，便于观察 system/history 如何改变模型输入。
+            if (!onPrompt(prompt)) {
+                return {};
+            }
+
             const std::vector<llama_token> promptTokens = tokenize(prompt, true);
             if (prefill(promptTokens) != static_cast<int>(promptTokens.size())) {
+                return {};
+            }
+
+            if (stopRequested_.load()) {
                 return {};
             }
 
@@ -232,12 +296,31 @@ namespace {
 
             std::string answer;
             for (int index = 0; index < maxTokens; ++index) {
+                // JNI 的停止请求可以在 Kotlin 主线程写入；atomic 让 Native 推理线程
+                // 无锁地安全读取。最迟在当前一个 Token 完成后退出。
+                if (stopRequested_.load()) {
+                    break;
+                }
+
                 const llama_token token = llama_sampler_sample(sampler, context_, -1);
                 if (llama_vocab_is_eog(vocab, token)) {
                     break;
                 }
 
-                answer += tokenToPiece(token, false);
+                const std::string piece = tokenToPiece(token, false);
+                answer += piece;
+
+                // Native 每采样出一个 Token，就把对应文字片段推回 Kotlin。
+                // 这样 Compose 不必等完整回答生成完才更新页面。
+                if (!piece.empty() && !onToken(piece)) {
+                    answer.clear();
+                    break;
+                }
+
+                if (stopRequested_.load()) {
+                    break;
+                }
+
                 llama_sampler_accept(sampler, token);
 
                 if (!decodeToken(token)) {
@@ -345,6 +428,7 @@ namespace {
         llama_model *model_ = nullptr;
         llama_context *context_ = nullptr;
         llama_pos nextPosition_ = 0;
+        std::atomic_bool stopRequested_ = false;
     };
 }
 
@@ -435,6 +519,30 @@ Java_com_arick_androidlocalllmlab_NativeLlmBridge_nativeReleaseContext(
     auto *runtime = toRuntime(handle);
     if (runtime != nullptr) {
         runtime->releaseContext();
+    }
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_arick_androidlocalllmlab_NativeLlmBridge_nativeRequestStop(
+        JNIEnv *env,
+        jobject /* thiz */,
+        jlong handle) {
+    auto *runtime = toRuntime(handle);
+    if (runtime != nullptr) {
+        runtime->requestStop();
+    }
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_arick_androidlocalllmlab_NativeLlmBridge_nativeResetStopRequest(
+        JNIEnv *env,
+        jobject /* thiz */,
+        jlong handle) {
+    auto *runtime = toRuntime(handle);
+    if (runtime != nullptr) {
+        runtime->resetStopRequest();
     }
 }
 
@@ -549,19 +657,93 @@ Java_com_arick_androidlocalllmlab_NativeLlmBridge_nativeGenerate(
         JNIEnv *env,
         jobject /* thiz */,
         jlong handle,
-        jstring prompt,
-        jint maxTokens) {
+        jobjectArray roles,
+        jobjectArray contents,
+        jint maxTokens,
+        jobject generationCallback) {
     auto *runtime = toRuntime(handle);
-    if (runtime == nullptr || prompt == nullptr || maxTokens <= 0) {
+    if (runtime == nullptr || roles == nullptr || contents == nullptr || maxTokens <= 0 || generationCallback == nullptr) {
         return env->NewStringUTF("");
     }
 
-    const char *promptChars = env->GetStringUTFChars(prompt, nullptr);
-    if (promptChars == nullptr) {
+    const jsize messageCount = env->GetArrayLength(roles);
+    if (messageCount == 0 || messageCount != env->GetArrayLength(contents)) {
         return env->NewStringUTF("");
     }
 
-    const std::string answer = runtime->generate(promptChars, maxTokens);
-    env->ReleaseStringUTFChars(prompt, promptChars);
+    std::vector<ChatMessage> history;
+    history.reserve(static_cast<size_t>(messageCount));
+    for (jsize index = 0; index < messageCount; ++index) {
+        auto *role = static_cast<jstring>(env->GetObjectArrayElement(roles, index));
+        auto *content = static_cast<jstring>(env->GetObjectArrayElement(contents, index));
+        if (role == nullptr || content == nullptr) {
+            return env->NewStringUTF("");
+        }
+
+        const char *roleChars = env->GetStringUTFChars(role, nullptr);
+        const char *contentChars = env->GetStringUTFChars(content, nullptr);
+        if (roleChars == nullptr || contentChars == nullptr) {
+            if (roleChars != nullptr) {
+                env->ReleaseStringUTFChars(role, roleChars);
+            }
+            if (contentChars != nullptr) {
+                env->ReleaseStringUTFChars(content, contentChars);
+            }
+            return env->NewStringUTF("");
+        }
+
+        history.push_back({roleChars, contentChars});
+        env->ReleaseStringUTFChars(role, roleChars);
+        env->ReleaseStringUTFChars(content, contentChars);
+        env->DeleteLocalRef(role);
+        env->DeleteLocalRef(content);
+    }
+
+    jclass callbackClass = env->GetObjectClass(generationCallback);
+    jmethodID onPromptMethod = callbackClass == nullptr
+            ? nullptr
+            : env->GetMethodID(callbackClass, "onPrompt", "(Ljava/lang/String;)V");
+    jmethodID onTokenMethod = callbackClass == nullptr
+            ? nullptr
+            : env->GetMethodID(callbackClass, "onToken", "(Ljava/lang/String;)V");
+    if (onPromptMethod == nullptr || onTokenMethod == nullptr) {
+        env->ExceptionClear();
+        return env->NewStringUTF("");
+    }
+
+    const std::string answer = runtime->generate(
+            history,
+            maxTokens,
+            [env, generationCallback, onPromptMethod](const std::string &prompt) {
+                jstring kotlinPrompt = env->NewStringUTF(prompt.c_str());
+                if (kotlinPrompt == nullptr) {
+                    return false;
+                }
+
+                env->CallVoidMethod(generationCallback, onPromptMethod, kotlinPrompt);
+                env->DeleteLocalRef(kotlinPrompt);
+
+                if (env->ExceptionCheck()) {
+                    env->ExceptionClear();
+                    return false;
+                }
+                return true;
+            },
+            [env, generationCallback, onTokenMethod](const std::string &piece) {
+                jstring kotlinPiece = env->NewStringUTF(piece.c_str());
+                if (kotlinPiece == nullptr) {
+                    return false;
+                }
+
+                env->CallVoidMethod(generationCallback, onTokenMethod, kotlinPiece);
+                env->DeleteLocalRef(kotlinPiece);
+
+                if (env->ExceptionCheck()) {
+                    env->ExceptionClear();
+                    return false;
+                }
+                return true;
+            }
+    );
     return env->NewStringUTF(answer.c_str());
 }

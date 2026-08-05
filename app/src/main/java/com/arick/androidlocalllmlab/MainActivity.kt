@@ -30,6 +30,7 @@ import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -67,7 +68,10 @@ class MainActivity : ComponentActivity() {
 private fun ChatScreen(viewModel: ChatViewModel) {
     val uiState by viewModel.uiState.collectAsState()
     val messages by viewModel.messages.collectAsState()
+    val systemPrompt by viewModel.systemPrompt.collectAsState()
+    val finalPrompt by viewModel.finalPrompt.collectAsState()
     val isGenerating by viewModel.isGenerating.collectAsState()
+    val isStopRequested by viewModel.isStopRequested.collectAsState()
     val generationError by viewModel.generationError.collectAsState()
     var prompt by remember { mutableStateOf("") }
     val selectModelLauncher = rememberLauncherForActivityResult(
@@ -86,7 +90,7 @@ private fun ChatScreen(viewModel: ChatViewModel) {
         topBar = {
             ChatHeader(
                 onSelectModel = {
-                    if (!isPreparing) {
+                    if (!isPreparing && !isGenerating) {
                         selectModelLauncher.launch(arrayOf("*/*"))
                     }
                 }
@@ -95,12 +99,15 @@ private fun ChatScreen(viewModel: ChatViewModel) {
         bottomBar = {
             ChatComposer(
                 prompt = prompt,
-                enabled = isModelReady && !isGenerating,
+                enabled = isModelReady,
+                isGenerating = isGenerating,
+                isStopRequested = isStopRequested,
                 onPromptChange = { prompt = it },
                 onSend = {
                     viewModel.send(prompt)
                     prompt = ""
-                }
+                },
+                onStop = viewModel::stopGenerating
             )
         }
     ) { innerPadding ->
@@ -129,8 +136,12 @@ private fun ChatScreen(viewModel: ChatViewModel) {
                     ChatContent(
                         nCtx = state.nCtx,
                         messages = messages,
+                        systemPrompt = systemPrompt,
+                        finalPrompt = finalPrompt,
                         isGenerating = isGenerating,
-                        errorMessage = generationError
+                        isStopRequested = isStopRequested,
+                        errorMessage = generationError,
+                        onSystemPromptChange = viewModel::updateSystemPrompt
                     )
                 }
 
@@ -191,8 +202,11 @@ private fun ChatHeader(onSelectModel: () -> Unit) {
 private fun ChatComposer(
     prompt: String,
     enabled: Boolean,
+    isGenerating: Boolean,
+    isStopRequested: Boolean,
     onPromptChange: (String) -> Unit,
-    onSend: () -> Unit
+    onSend: () -> Unit,
+    onStop: () -> Unit
 ) {
     Column(
         modifier = Modifier
@@ -224,7 +238,12 @@ private fun ChatComposer(
                 ) {
                     if (prompt.isBlank()) {
                         Text(
-                            text = if (enabled) "发消息" else "正在准备本地模型…",
+                            text = when {
+                                isStopRequested -> "正在停止…"
+                                isGenerating -> "正在生成…"
+                                enabled -> "发消息"
+                                else -> "正在准备本地模型…"
+                            },
                             color = Color(0xFFAAAAAA),
                             fontSize = 16.sp
                         )
@@ -232,7 +251,7 @@ private fun ChatComposer(
 
                     BasicTextField(
                         value = prompt,
-                        enabled = enabled,
+                        enabled = enabled && !isGenerating,
                         onValueChange = onPromptChange,
                         singleLine = true,
                         textStyle = TextStyle(
@@ -244,23 +263,29 @@ private fun ChatComposer(
                 }
 
                 Surface(
-                    color = if (enabled && prompt.isNotBlank()) {
-                        Color(0xFF1677FF)
-                    } else {
-                        Color(0xFFE5E5E5)
+                    color = when {
+                        isStopRequested -> Color(0xFF999999)
+                        isGenerating -> Color(0xFFE85D5D)
+                        enabled && prompt.isNotBlank() -> Color(0xFF1677FF)
+                        else -> Color(0xFFE5E5E5)
                     },
                     shape = CircleShape
                 ) {
                     IconButton(
                         modifier = Modifier.size(28.dp),
-                        enabled = enabled && prompt.isNotBlank(),
-                        onClick = onSend
+                        enabled = (isGenerating && !isStopRequested) ||
+                                (!isGenerating && enabled && prompt.isNotBlank()),
+                        onClick = if (isGenerating) onStop else onSend
                     ) {
-                        Icon(
-                            imageVector = Icons.Default.ArrowUpward,
-                            contentDescription = "发送",
-                            tint = Color.White
-                        )
+                        if (isGenerating) {
+                            Text("■", color = Color.White, fontSize = 12.sp)
+                        } else {
+                            Icon(
+                                imageVector = Icons.Default.ArrowUpward,
+                                contentDescription = "发送",
+                                tint = Color.White
+                            )
+                        }
                     }
                 }
             }
@@ -272,8 +297,12 @@ private fun ChatComposer(
 private fun ChatContent(
     nCtx: Int,
     messages: List<ChatMessage>,
+    systemPrompt: String,
+    finalPrompt: String,
     isGenerating: Boolean,
-    errorMessage: String?
+    isStopRequested: Boolean,
+    errorMessage: String?,
+    onSystemPromptChange: (String) -> Unit
 ) {
     Column(
         modifier = Modifier
@@ -288,9 +317,42 @@ private fun ChatContent(
             fontSize = 12.sp
         )
 
-        messages.forEach { message ->
+        OutlinedTextField(
+            value = systemPrompt,
+            onValueChange = onSystemPromptChange,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 12.dp),
+            enabled = !isGenerating,
+            label = { Text("System Prompt") },
+            placeholder = { Text("例如：你是简洁的 Android 助手") },
+            minLines = 2,
+            maxLines = 3,
+            textStyle = TextStyle(fontSize = 14.sp)
+        )
+
+        if (finalPrompt.isNotBlank()) {
             Text(
-                text = if (message.role == MessageRole.User) "我" else "AI",
+                text = "本轮最终 Prompt（Native 模板化后）",
+                modifier = Modifier.padding(top = 16.dp),
+                color = Color(0xFF777777),
+                fontSize = 12.sp
+            )
+            Text(
+                text = finalPrompt,
+                modifier = Modifier.padding(top = 4.dp),
+                color = Color(0xFF555555),
+                fontSize = 12.sp
+            )
+        }
+
+        messages.filter { it.content.isNotBlank() }.forEach { message ->
+            Text(
+                text = when (message.role) {
+                    MessageRole.System -> "System"
+                    MessageRole.User -> "我"
+                    MessageRole.Assistant -> "AI"
+                },
                 modifier = Modifier.padding(top = 20.dp),
                 color = Color(0xFF777777),
                 fontSize = 12.sp
@@ -305,7 +367,7 @@ private fun ChatContent(
 
         if (isGenerating) {
             Text(
-                text = "正在生成…",
+                text = if (isStopRequested) "正在停止…" else "正在生成…",
                 modifier = Modifier.padding(top = 20.dp),
                 color = Color(0xFF777777),
                 fontSize = 12.sp
