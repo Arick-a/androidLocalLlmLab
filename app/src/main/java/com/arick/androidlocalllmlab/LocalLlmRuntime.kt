@@ -42,6 +42,11 @@ class LocalLlmRuntime : AutoCloseable {
         NativeLlmBridge.nativeReleaseContext(nativeHandle)
     }
 
+    fun resetContext() {
+        check(nativeHandle != 0L) { "Runtime has not been created" }
+        NativeLlmBridge.nativeResetContext(nativeHandle)
+    }
+
     fun requestStop() {
         if (nativeHandle != 0L) {
             NativeLlmBridge.nativeRequestStop(nativeHandle)
@@ -96,6 +101,27 @@ class LocalLlmRuntime : AutoCloseable {
         return NativeLlmBridge.nativeTokenize(
             handle = nativeHandle,
             text = text
+        )
+    }
+
+    /**
+     * 先应用当前 GGUF 的 Chat Template，再计算真实 Prompt Token 数。
+     * 这个计数用于 Kotlin 的历史裁剪，不能用字符串长度或普通 tokenize() 替代。
+     */
+    fun countChatPromptTokens(messages: List<ChatMessage>): Int {
+        check(nativeHandle != 0L) { "Runtime has not been created" }
+        check(messages.isNotEmpty()) { "messages must not be empty" }
+
+        return NativeLlmBridge.nativeCountChatPromptTokens(
+            handle = nativeHandle,
+            roles = messages.map { message ->
+                when (message.role) {
+                    MessageRole.System -> "system"
+                    MessageRole.User -> "user"
+                    MessageRole.Assistant -> "assistant"
+                }
+            }.toTypedArray(),
+            contents = messages.map(ChatMessage::content).toTypedArray()
         )
     }
 

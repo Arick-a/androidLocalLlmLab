@@ -90,6 +90,16 @@ namespace {
             nextPosition_ = 0;
         }
 
+        // 不释放模型权重，只清除当前会话在 Native 中累积的 KV Cache。
+        void resetContext() {
+            if (context_ == nullptr) {
+                return;
+            }
+
+            llama_memory_clear(llama_get_memory(context_), false);
+            nextPosition_ = 0;
+        }
+
         void requestStop() {
             stopRequested_.store(true);
         }
@@ -144,6 +154,78 @@ namespace {
 
             tokens.resize(static_cast<size_t>(tokenCount));
             return tokens;
+        }
+
+        // 使用当前 GGUF 自带的 Chat Template 生成 Prompt。计数和真正推理必须复用
+        // 这条路径，否则 Kotlin 按 Token 预算裁剪时会与 Native 实际 Prefill 不一致。
+        std::string formatChatPrompt(const std::vector<ChatMessage> &history) const {
+            if (model_ == nullptr || history.empty()) {
+                return {};
+            }
+
+            const char *chatTemplate = llama_model_chat_template(model_, nullptr);
+            if (chatTemplate == nullptr) {
+                __android_log_print(
+                        ANDROID_LOG_WARN,
+                        kLogTag,
+                        "The loaded GGUF has no chat template"
+                );
+                return {};
+            }
+
+            std::vector<llama_chat_message> messages;
+            messages.reserve(history.size());
+            size_t totalCharacters = 0;
+            for (const ChatMessage &message : history) {
+                if (message.role.empty() || message.content.empty()) {
+                    return {};
+                }
+                messages.push_back({message.role.c_str(), message.content.c_str()});
+                totalCharacters += message.role.size() + message.content.size();
+            }
+
+            std::vector<char> formattedPrompt(totalCharacters * 2 + 128);
+            int32_t promptLength = llama_chat_apply_template(
+                    chatTemplate,
+                    messages.data(),
+                    messages.size(),
+                    true,
+                    formattedPrompt.data(),
+                    static_cast<int32_t>(formattedPrompt.size())
+            );
+
+            if (promptLength < 0) {
+                return {};
+            }
+
+            if (promptLength > static_cast<int32_t>(formattedPrompt.size())) {
+                formattedPrompt.resize(static_cast<size_t>(promptLength));
+                promptLength = llama_chat_apply_template(
+                        chatTemplate,
+                        messages.data(),
+                        messages.size(),
+                        true,
+                        formattedPrompt.data(),
+                        static_cast<int32_t>(formattedPrompt.size())
+                );
+            }
+
+            if (promptLength <= 0) {
+                return {};
+            }
+
+            return {
+                    formattedPrompt.data(),
+                    static_cast<size_t>(promptLength)
+            };
+        }
+
+        int countChatPromptTokens(const std::vector<ChatMessage> &history) const {
+            const std::string prompt = formatChatPrompt(history);
+            if (prompt.empty()) {
+                return 0;
+            }
+            return static_cast<int>(tokenize(prompt, true).size());
         }
 
         int prefill(const std::vector<llama_token> &tokens) {
@@ -207,67 +289,10 @@ namespace {
                 return {};
             }
 
-            // 模板来自当前 GGUF 的 tokenizer.chat_template 元数据，而不是写死 Qwen 的
-            // ChatML。不同 Instruct 模型（Qwen、Llama、Mistral 等）可以各自决定
-            // user / assistant 消息应如何组织。
-            const char *chatTemplate = llama_model_chat_template(model_, nullptr);
-            if (chatTemplate == nullptr) {
-                __android_log_print(
-                        ANDROID_LOG_WARN,
-                        kLogTag,
-                        "The loaded GGUF has no chat template"
-                );
+            const std::string prompt = formatChatPrompt(history);
+            if (prompt.empty()) {
                 return {};
             }
-
-            // 保持字符串所有权，再创建 llama.cpp 所需的 role/content 指针数组。
-            // 这样每轮都能把 user 与 assistant 的完整历史交给同一个模型模板。
-            std::vector<llama_chat_message> messages;
-            messages.reserve(history.size());
-            size_t totalCharacters = 0;
-            for (const ChatMessage &message : history) {
-                if (message.role.empty() || message.content.empty()) {
-                    return {};
-                }
-                messages.push_back({message.role.c_str(), message.content.c_str()});
-                totalCharacters += message.role.size() + message.content.size();
-            }
-
-            // addAssistant=true 表示结尾追加 assistant 的回复起始标记。
-            std::vector<char> formattedPrompt(totalCharacters * 2 + 128);
-            int32_t promptLength = llama_chat_apply_template(
-                    chatTemplate,
-                    messages.data(),
-                    messages.size(),
-                    true,
-                    formattedPrompt.data(),
-                    static_cast<int32_t>(formattedPrompt.size())
-            );
-
-            if (promptLength < 0) {
-                return {};
-            }
-
-            if (promptLength > static_cast<int32_t>(formattedPrompt.size())) {
-                formattedPrompt.resize(static_cast<size_t>(promptLength));
-                promptLength = llama_chat_apply_template(
-                        chatTemplate,
-                        messages.data(),
-                        messages.size(),
-                        true,
-                        formattedPrompt.data(),
-                        static_cast<int32_t>(formattedPrompt.size())
-                );
-            }
-
-            if (promptLength <= 0) {
-                return {};
-            }
-
-            const std::string prompt(
-                    formattedPrompt.data(),
-                    static_cast<size_t>(promptLength)
-            );
 
             const std::vector<llama_token> promptTokens = tokenize(prompt, true);
             // Token 数由当前 GGUF 的 tokenizer 得到，因此包含模型模板标记与特殊 Token。
@@ -436,6 +461,60 @@ NativeRuntime *toRuntime(jlong handle) {
     return reinterpret_cast<NativeRuntime *>(handle);
 }
 
+// Kotlin 的 List<ChatMessage> 会以两个并行 String 数组传进 JNI。两个入口（计数、
+// 生成）共用此转换，确保它们看到的是同一组 role/content。
+bool readChatHistory(
+        JNIEnv *env,
+        jobjectArray roles,
+        jobjectArray contents,
+        std::vector<ChatMessage> *history) {
+    if (roles == nullptr || contents == nullptr || history == nullptr) {
+        return false;
+    }
+
+    const jsize messageCount = env->GetArrayLength(roles);
+    if (messageCount == 0 || messageCount != env->GetArrayLength(contents)) {
+        return false;
+    }
+
+    history->clear();
+    history->reserve(static_cast<size_t>(messageCount));
+    for (jsize index = 0; index < messageCount; ++index) {
+        auto *role = static_cast<jstring>(env->GetObjectArrayElement(roles, index));
+        auto *content = static_cast<jstring>(env->GetObjectArrayElement(contents, index));
+        if (role == nullptr || content == nullptr) {
+            if (role != nullptr) {
+                env->DeleteLocalRef(role);
+            }
+            if (content != nullptr) {
+                env->DeleteLocalRef(content);
+            }
+            return false;
+        }
+
+        const char *roleChars = env->GetStringUTFChars(role, nullptr);
+        const char *contentChars = env->GetStringUTFChars(content, nullptr);
+        if (roleChars == nullptr || contentChars == nullptr) {
+            if (roleChars != nullptr) {
+                env->ReleaseStringUTFChars(role, roleChars);
+            }
+            if (contentChars != nullptr) {
+                env->ReleaseStringUTFChars(content, contentChars);
+            }
+            env->DeleteLocalRef(role);
+            env->DeleteLocalRef(content);
+            return false;
+        }
+
+        history->push_back({roleChars, contentChars});
+        env->ReleaseStringUTFChars(role, roleChars);
+        env->ReleaseStringUTFChars(content, contentChars);
+        env->DeleteLocalRef(role);
+        env->DeleteLocalRef(content);
+    }
+    return true;
+}
+
 extern "C"
 JNIEXPORT jlong JNICALL
 Java_com_arick_androidlocalllmlab_NativeLlmBridge_nativeCreateRuntime(
@@ -524,6 +603,18 @@ Java_com_arick_androidlocalllmlab_NativeLlmBridge_nativeReleaseContext(
 
 extern "C"
 JNIEXPORT void JNICALL
+Java_com_arick_androidlocalllmlab_NativeLlmBridge_nativeResetContext(
+        JNIEnv *env,
+        jobject /* thiz */,
+        jlong handle) {
+    auto *runtime = toRuntime(handle);
+    if (runtime != nullptr) {
+        runtime->resetContext();
+    }
+}
+
+extern "C"
+JNIEXPORT void JNICALL
 Java_com_arick_androidlocalllmlab_NativeLlmBridge_nativeRequestStop(
         JNIEnv *env,
         jobject /* thiz */,
@@ -583,6 +674,23 @@ Java_com_arick_androidlocalllmlab_NativeLlmBridge_nativeTokenize(
     );
 
     return result;
+}
+
+extern "C"
+JNIEXPORT jint JNICALL
+Java_com_arick_androidlocalllmlab_NativeLlmBridge_nativeCountChatPromptTokens(
+        JNIEnv *env,
+        jobject /* thiz */,
+        jlong handle,
+        jobjectArray roles,
+        jobjectArray contents) {
+    auto *runtime = toRuntime(handle);
+    std::vector<ChatMessage> history;
+    if (runtime == nullptr || !readChatHistory(env, roles, contents, &history)) {
+        return 0;
+    }
+
+    return runtime->countChatPromptTokens(history);
 }
 
 extern "C"
@@ -662,41 +770,13 @@ Java_com_arick_androidlocalllmlab_NativeLlmBridge_nativeGenerate(
         jint maxTokens,
         jobject generationCallback) {
     auto *runtime = toRuntime(handle);
-    if (runtime == nullptr || roles == nullptr || contents == nullptr || maxTokens <= 0 || generationCallback == nullptr) {
-        return env->NewStringUTF("");
-    }
-
-    const jsize messageCount = env->GetArrayLength(roles);
-    if (messageCount == 0 || messageCount != env->GetArrayLength(contents)) {
+    if (runtime == nullptr || maxTokens <= 0 || generationCallback == nullptr) {
         return env->NewStringUTF("");
     }
 
     std::vector<ChatMessage> history;
-    history.reserve(static_cast<size_t>(messageCount));
-    for (jsize index = 0; index < messageCount; ++index) {
-        auto *role = static_cast<jstring>(env->GetObjectArrayElement(roles, index));
-        auto *content = static_cast<jstring>(env->GetObjectArrayElement(contents, index));
-        if (role == nullptr || content == nullptr) {
-            return env->NewStringUTF("");
-        }
-
-        const char *roleChars = env->GetStringUTFChars(role, nullptr);
-        const char *contentChars = env->GetStringUTFChars(content, nullptr);
-        if (roleChars == nullptr || contentChars == nullptr) {
-            if (roleChars != nullptr) {
-                env->ReleaseStringUTFChars(role, roleChars);
-            }
-            if (contentChars != nullptr) {
-                env->ReleaseStringUTFChars(content, contentChars);
-            }
-            return env->NewStringUTF("");
-        }
-
-        history.push_back({roleChars, contentChars});
-        env->ReleaseStringUTFChars(role, roleChars);
-        env->ReleaseStringUTFChars(content, contentChars);
-        env->DeleteLocalRef(role);
-        env->DeleteLocalRef(content);
+    if (!readChatHistory(env, roles, contents, &history)) {
+        return env->NewStringUTF("");
     }
 
     jclass callbackClass = env->GetObjectClass(generationCallback);

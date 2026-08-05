@@ -29,6 +29,8 @@ object NativeLlmBridge {
 
     external fun nativeReleaseContext(handle: Long)
 
+    external fun nativeResetContext(handle: Long)
+
     external fun nativeRequestStop(handle: Long)
 
     external fun nativeResetStopRequest(handle: Long)
@@ -37,6 +39,12 @@ object NativeLlmBridge {
         handle: Long,
         text: String
     ): IntArray
+
+    external fun nativeCountChatPromptTokens(
+        handle: Long,
+        roles: Array<String>,
+        contents: Array<String>
+    ): Int
 
     external fun nativePrefill(
         handle: Long,

@@ -84,6 +84,7 @@ private fun ChatScreen(viewModel: ChatViewModel) {
     val systemPrompt by viewModel.systemPrompt.collectAsState()
     val finalPrompt by viewModel.finalPrompt.collectAsState()
     val promptTokenCount by viewModel.promptTokenCount.collectAsState()
+    val trimmedHistoryTurnCount by viewModel.trimmedHistoryTurnCount.collectAsState()
     val requestedNctx by viewModel.requestedNctx.collectAsState()
     val isGenerating by viewModel.isGenerating.collectAsState()
     val isStopRequested by viewModel.isStopRequested.collectAsState()
@@ -114,14 +115,21 @@ private fun ChatScreen(viewModel: ChatViewModel) {
             systemPrompt = systemPrompt,
             finalPrompt = finalPrompt,
             promptTokenCount = promptTokenCount,
+            trimmedHistoryTurnCount = trimmedHistoryTurnCount,
             nCtx = (uiState as? ChatUiState.Ready)?.nCtx,
             requestedNctx = requestedNctx,
             isGenerating = isGenerating,
             onSystemPromptChange = viewModel::updateSystemPrompt,
             onContextWindowChange = viewModel::updateContextWindow,
+            onClearConversation = viewModel::clearConversation,
+            onResetContext = viewModel::resetContext,
             onSelectModel = {
                 isSettingsVisible = false
                 selectModelLauncher.launch(arrayOf("*/*"))
+            },
+            onReleaseModel = {
+                viewModel.releaseModel()
+                isSettingsVisible = false
             },
             onBack = { isSettingsVisible = false }
         )
@@ -455,17 +463,24 @@ private fun ConversationSettingsScreen(
     systemPrompt: String,
     finalPrompt: String,
     promptTokenCount: Int,
+    trimmedHistoryTurnCount: Int,
     nCtx: Int?,
     requestedNctx: Int,
     isGenerating: Boolean,
     onSystemPromptChange: (String) -> Unit,
     onContextWindowChange: (Int) -> Unit,
+    onClearConversation: () -> Unit,
+    onResetContext: () -> Unit,
     onSelectModel: () -> Unit,
+    onReleaseModel: () -> Unit,
     onBack: () -> Unit
 ) {
     var isSystemPromptDialogVisible by remember { mutableStateOf(false) }
     var isFinalPromptDialogVisible by remember { mutableStateOf(false) }
     var isContextWindowDialogVisible by remember { mutableStateOf(false) }
+    var isClearConversationDialogVisible by remember { mutableStateOf(false) }
+    var isResetContextDialogVisible by remember { mutableStateOf(false) }
+    var isReleaseModelDialogVisible by remember { mutableStateOf(false) }
     var systemPromptDraft by remember { mutableStateOf(systemPrompt) }
     var contextWindowDraft by remember { mutableStateOf(requestedNctx) }
 
@@ -514,9 +529,15 @@ private fun ConversationSettingsScreen(
                 )
                 SettingsRow(
                     title = "最终 Prompt",
-                    summary = if (finalPrompt.isBlank()) "暂无" else "$promptTokenCount tokens",
+                    summary = if (finalPrompt.isBlank()) "暂无" else "查看",
                     enabled = finalPrompt.isNotBlank(),
                     onClick = { isFinalPromptDialogVisible = true }
+                )
+                SettingsRow(
+                    title = "清空聊天消息",
+                    summary = "保留模型",
+                    enabled = !isGenerating && nCtx != null,
+                    onClick = { isClearConversationDialogVisible = true }
                 )
             }
 
@@ -533,6 +554,36 @@ private fun ConversationSettingsScreen(
                         isContextWindowDialogVisible = true
                     }
                 )
+                SettingsRow(
+                    title = "上下文占用",
+                    // Native 回调的 token 数包含 Chat Template 和特殊 Token，
+                    // 即本轮真正 Prefill 到 Context 中的 Prompt 占用。
+                    summary = if (promptTokenCount == 0) {
+                        "暂无"
+                    } else {
+                        "$promptTokenCount / ${nCtx ?: requestedNctx} tokens"
+                    },
+                    showChevron = false,
+                    clickable = false,
+                    onClick = {}
+                )
+                SettingsRow(
+                    title = "历史裁剪",
+                    summary = if (trimmedHistoryTurnCount == 0) {
+                        "未触发"
+                    } else {
+                        "本轮省略 $trimmedHistoryTurnCount 轮"
+                    },
+                    showChevron = false,
+                    clickable = false,
+                    onClick = {}
+                )
+                SettingsRow(
+                    title = "重置 Context",
+                    summary = "清空 KV Cache",
+                    enabled = !isGenerating && nCtx != null,
+                    onClick = { isResetContextDialogVisible = true }
+                )
             }
 
             SettingsSection(
@@ -543,6 +594,12 @@ private fun ConversationSettingsScreen(
                     title = "切换本地模型",
                     enabled = !isGenerating,
                     onClick = onSelectModel
+                )
+                SettingsRow(
+                    title = "卸载本地模型",
+                    summary = "释放内存",
+                    enabled = !isGenerating && nCtx != null,
+                    onClick = { isReleaseModelDialogVisible = true }
                 )
             }
         }
@@ -658,6 +715,77 @@ private fun ConversationSettingsScreen(
             }
         )
     }
+
+    if (isClearConversationDialogVisible) {
+        ConfirmActionDialog(
+            title = "清空聊天消息？",
+            message = "只清空当前页面的聊天记录；模型和 Native Context 会继续保留。",
+            confirmText = "清空",
+            onConfirm = {
+                onClearConversation()
+                isClearConversationDialogVisible = false
+            },
+            onDismiss = { isClearConversationDialogVisible = false }
+        )
+    }
+
+    if (isResetContextDialogVisible) {
+        ConfirmActionDialog(
+            title = "重置 Context？",
+            message = "这会清空 Native KV Cache，但不会删除当前聊天消息或卸载模型。",
+            confirmText = "重置",
+            onConfirm = {
+                onResetContext()
+                isResetContextDialogVisible = false
+            },
+            onDismiss = { isResetContextDialogVisible = false }
+        )
+    }
+
+    if (isReleaseModelDialogVisible) {
+        ConfirmActionDialog(
+            title = "卸载本地模型？",
+            message = "这会释放 Native Context、模型权重和 Runtime，并取消下次启动时自动恢复该模型。",
+            confirmText = "卸载",
+            onConfirm = {
+                onReleaseModel()
+                isReleaseModelDialogVisible = false
+            },
+            onDismiss = { isReleaseModelDialogVisible = false }
+        )
+    }
+}
+
+@Composable
+private fun ConfirmActionDialog(
+    title: String,
+    message: String,
+    confirmText: String,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = AppColors.Surface,
+        title = { Text(title, fontSize = 16.sp) },
+        text = {
+            Text(
+                text = message,
+                color = AppColors.TextTertiary,
+                fontSize = 12.sp
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = onConfirm) {
+                Text(confirmText)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("取消")
+            }
+        }
+    )
 }
 
 @Composable
@@ -691,12 +819,19 @@ private fun SettingsRow(
     summary: String? = null,
     enabled: Boolean = true,
     showChevron: Boolean = true,
+    clickable: Boolean = true,
     onClick: () -> Unit
 ) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(enabled = enabled, onClick = onClick)
+            .then(
+                if (clickable) {
+                    Modifier.clickable(enabled = enabled, onClick = onClick)
+                } else {
+                    Modifier
+                }
+            )
             .padding(horizontal = 20.dp, vertical = 13.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
