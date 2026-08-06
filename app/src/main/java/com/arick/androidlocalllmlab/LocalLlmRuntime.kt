@@ -210,6 +210,7 @@ class LocalLlmRuntime : AutoCloseable {
 
                 override fun onMetrics(
                     generatedTokenCount: Int,
+                    reusedPromptTokenCount: Int,
                     prefillMillis: Long,
                     firstTokenMillis: Long,
                     decodeMillis: Long,
@@ -217,6 +218,7 @@ class LocalLlmRuntime : AutoCloseable {
                 ) = onMetrics(
                     GenerationMetrics(
                         generatedTokenCount = generatedTokenCount,
+                        reusedPromptTokenCount = reusedPromptTokenCount,
                         prefillMillis = prefillMillis,
                         firstTokenMillis = firstTokenMillis,
                         decodeMillis = decodeMillis,
@@ -247,7 +249,8 @@ data class InferenceConfig(
     val minP: Float = 0.05f,
     val repeatPenalty: Float = 1.10f,
     val seed: Int = 42,
-    val maxTokens: Int = 256
+    // 输出上限是硬截断边界；日常长回答默认留出 2048 Token。
+    val maxTokens: Int = 2048
 ) {
     val isGreedy: Boolean
         get() = temperature <= 0f
@@ -256,6 +259,8 @@ data class InferenceConfig(
 /** 一轮 Native 推理的真实耗时；单位统一为毫秒，避免 Kotlin 侧猜测。 */
 data class GenerationMetrics(
     val generatedTokenCount: Int,
+    /** 本轮 Prompt 中已经存在于 Native Context/KV Cache 的 Token 数。 */
+    val reusedPromptTokenCount: Int,
     val prefillMillis: Long,
     val firstTokenMillis: Long,
     val decodeMillis: Long,
@@ -263,4 +268,16 @@ data class GenerationMetrics(
 ) {
     val decodeTokensPerSecond: Double
         get() = if (decodeMillis <= 0L) 0.0 else generatedTokenCount * 1_000.0 / decodeMillis
+}
+
+enum class SamplingPreset(
+    val label: String,
+    val config: InferenceConfig
+) {
+    Stable("稳定", InferenceConfig(temperature = 0f, maxTokens = 2048)),
+    Balanced("均衡", InferenceConfig(temperature = 0.7f, topK = 40, topP = 0.95f, minP = 0.05f, repeatPenalty = 1.10f, seed = -1, maxTokens = 2048)),
+    Creative("创意", InferenceConfig(temperature = 1.0f, topK = 80, topP = 0.95f, minP = 0.05f, repeatPenalty = 1.05f, seed = -1, maxTokens = 2048)),
+    Reproducible("可复现", InferenceConfig(temperature = 0.7f, topK = 40, topP = 0.95f, minP = 0.05f, repeatPenalty = 1.10f, seed = 42, maxTokens = 2048));
+
+    fun configFor(nCtx: Int): InferenceConfig = config.copy(maxTokens = config.maxTokens.coerceAtMost(nCtx - 1))
 }

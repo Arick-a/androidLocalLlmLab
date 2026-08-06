@@ -42,7 +42,11 @@ data class ChatMessage(
     val role: MessageRole,
     val content: String,
     // reasoning 不直接混入普通回答；展示层可将它渲染为可折叠区域。
-    val reasoningContent: String = ""
+    val reasoningContent: String = "",
+    // 展开状态属于会话 UI 数据，不能交给 Composable remember，否则流式内容变化或页面切换会丢失。
+    val isReasoningExpanded: Boolean = true,
+    // 从首个思考 Token 到正文开始的真实流式耗时。
+    val reasoningDurationMillis: Long? = null
 )
 
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
@@ -75,7 +79,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val _trimmedHistoryTurnCount = MutableStateFlow(0)
     val trimmedHistoryTurnCount: StateFlow<Int> = _trimmedHistoryTurnCount.asStateFlow()
 
-    private val _requestedNctx = MutableStateFlow(2048)
+    // 4096 是允许 2048 输出的最低实用档；更长多轮对话由设置页按设备内存升到 8K 以上。
+    private val _requestedNctx = MutableStateFlow(4096)
     val requestedNctx: StateFlow<Int> = _requestedNctx.asStateFlow()
 
     // 当前实验真机已验证 8 线程更快；仍限制为设备实际可用核心数，设置页可继续做对照实验。
@@ -228,7 +233,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
                     var assistantRawContent = ""
                     var templateStartsThinking = false
-                    runtime.generate(
+                    var reasoningStartedAtNanos: Long? = null
+                    var reasoningFinishedAtNanos: Long? = null
+                    val generatedAnswer = runtime.generate(
                         messages = trimmedHistory.messages,
                         inferenceConfig = inferenceConfig,
                         onPrompt = { finalPrompt, tokenCount ->
@@ -244,12 +251,25 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                 rawContent = assistantRawContent,
                                 templateStartsThinking = templateStartsThinking
                             )
+                            val nowNanos = System.nanoTime()
+                            val reasoningDurationMillis = if (assistantParts.reasoning.isNotBlank()) {
+                                val startedAt = reasoningStartedAtNanos ?: nowNanos.also {
+                                    reasoningStartedAtNanos = it
+                                }
+                                if (assistantParts.answer.isNotBlank() && reasoningFinishedAtNanos == null) {
+                                    reasoningFinishedAtNanos = nowNanos
+                                }
+                                ((reasoningFinishedAtNanos ?: nowNanos) - startedAt) / 1_000_000
+                            } else {
+                                null
+                            }
                             val currentMessages = _messages.value
                             _messages.value = currentMessages.mapIndexed { index, message ->
                                 if (index == currentMessages.lastIndex) {
                                     message.copy(
                                         content = assistantParts.answer,
-                                        reasoningContent = assistantParts.reasoning
+                                        reasoningContent = assistantParts.reasoning,
+                                        reasoningDurationMillis = reasoningDurationMillis
                                     )
                                 } else {
                                     message
@@ -260,6 +280,24 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             _generationMetrics.value = metrics
                         }
                     )
+                    // Native 返回的是完整 UTF-8 原始回答。流式回调即使遇到异常字节片段，
+                    // 结束后也必须以完整结果回填，不能把临时显示的乱码写入会话历史。
+                    val finalAssistantParts = splitAssistantResponse(
+                        rawContent = generatedAnswer,
+                        templateStartsThinking = templateStartsThinking
+                    )
+                    val currentMessages = _messages.value
+                    _messages.value = currentMessages.mapIndexed { index, message ->
+                        if (index == currentMessages.lastIndex) {
+                            message.copy(
+                                content = finalAssistantParts.answer,
+                                reasoningContent = finalAssistantParts.reasoning
+                            )
+                        } else {
+                            message
+                        }
+                    }
+                    generatedAnswer
                 }
                 if (answer.isBlank() && !_isStopRequested.value) {
                     error("模型没有返回内容")
@@ -357,6 +395,19 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun toggleReasoning(messageIndex: Int) {
+        if (messageIndex !in _messages.value.indices) {
+            return
+        }
+        _messages.value = _messages.value.mapIndexed { index, message ->
+            if (index == messageIndex && message.reasoningContent.isNotBlank()) {
+                message.copy(isReasoningExpanded = !message.isReasoningExpanded)
+            } else {
+                message
+            }
+        }
+    }
+
     fun updateContextWindow(requestedNctx: Int) {
         if (requestedNctx <= 0 || _isGenerating.value || _uiState.value is ChatUiState.Preparing) {
             return
@@ -381,6 +432,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 check(actualNctx > 0) { "Context 创建失败" }
 
                 _requestedNctx.value = requestedNctx
+                // n_ctx 缩小时，输出预留也必须同步落到可用档位；否则直到下一次发送
+                // 才会因为 maxTokens >= n_ctx 失败。
+                val maxTokens = listOf(2048, 4096, 6000)
+                    .last { it < actualNctx }
+                _inferenceConfig.value = _inferenceConfig.value.copy(
+                    maxTokens = _inferenceConfig.value.maxTokens.coerceAtMost(maxTokens)
+                )
                 _uiState.value = ChatUiState.Ready(
                     currentState.modelFile,
                     actualNctx,

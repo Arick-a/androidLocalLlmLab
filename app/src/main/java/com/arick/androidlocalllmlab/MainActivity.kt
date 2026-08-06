@@ -10,6 +10,7 @@ import androidx.activity.viewModels
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -35,6 +36,7 @@ import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.ModalDrawerSheet
@@ -50,22 +52,30 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.foundation.text.BasicTextField
 import com.arick.androidlocalllmlab.ui.theme.AppColors
 import com.arick.androidlocalllmlab.ui.theme.AndroidLocalLlmLabTheme
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.collect
 import java.util.Locale
 import kotlin.math.roundToInt
 
@@ -220,7 +230,8 @@ private fun ChatScreen(viewModel: ChatViewModel) {
                             isGenerating = isGenerating,
                             isStopRequested = isStopRequested,
                             generationProgress = generationProgress,
-                            errorMessage = generationError
+                            errorMessage = generationError,
+                            onToggleReasoning = viewModel::toggleReasoning
                         )
 
                         is ChatUiState.Error -> EmptyState(
@@ -388,16 +399,50 @@ private fun ChatContent(
     isGenerating: Boolean,
     isStopRequested: Boolean,
     generationProgress: String?,
-    errorMessage: String?
+    errorMessage: String?,
+    onToggleReasoning: (Int) -> Unit
 ) {
-    Column(
+    val scrollState = rememberScrollState()
+    val coroutineScope = rememberCoroutineScope()
+    var shouldFollowBottom by remember { mutableStateOf(true) }
+    var isAutoScrolling by remember { mutableStateOf(false) }
+
+    // 用户手势向上查看历史时暂停跟随；自己滚到底部后自动恢复。
+    LaunchedEffect(scrollState) {
+        snapshotFlow { scrollState.isScrollInProgress to scrollState.canScrollForward }
+            .collect { (isScrolling, canScrollForward) ->
+                if (isScrolling && canScrollForward && !isAutoScrolling) {
+                    shouldFollowBottom = false
+                }
+                if (!canScrollForward) {
+                    shouldFollowBottom = true
+                }
+            }
+    }
+
+    // messages 在每个流式 Token 到来时更新。仅在用户仍停留底部时，才跟随新内容。
+    LaunchedEffect(messages, generationProgress, shouldFollowBottom) {
+        if (shouldFollowBottom) {
+            isAutoScrolling = true
+            scrollState.scrollTo(scrollState.maxValue)
+            isAutoScrolling = false
+        }
+    }
+
+    Box(modifier = Modifier.fillMaxSize()) {
+        Column(
         modifier = Modifier
             .fillMaxSize()
-            .verticalScroll(rememberScrollState())
+            .verticalScroll(scrollState)
             .padding(horizontal = 18.dp, vertical = 12.dp)
     ) {
-        messages.filter { it.content.isNotBlank() || it.reasoningContent.isNotBlank() }.forEach { message ->
-            ChatMessageItem(message)
+        messages.forEachIndexed { index, message ->
+            if (message.content.isNotBlank() || message.reasoningContent.isNotBlank()) {
+                ChatMessageItem(
+                    message = message,
+                    onToggleReasoning = { onToggleReasoning(index) }
+                )
+            }
         }
 
         if (isGenerating) {
@@ -418,10 +463,43 @@ private fun ChatContent(
             )
         }
     }
+
+        if (!shouldFollowBottom && scrollState.canScrollForward) {
+            Surface(
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(end = 20.dp, bottom = 12.dp),
+                color = AppColors.Surface,
+                shape = CircleShape,
+                shadowElevation = 4.dp
+            ) {
+                IconButton(
+                    modifier = Modifier.size(40.dp),
+                    onClick = {
+                        coroutineScope.launch {
+                            shouldFollowBottom = true
+                            isAutoScrolling = true
+                            scrollState.animateScrollTo(scrollState.maxValue)
+                            isAutoScrolling = false
+                        }
+                    }
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.KeyboardArrowDown,
+                        contentDescription = "回到最新消息",
+                        tint = AppColors.TextPrimary
+                    )
+                }
+            }
+        }
+    }
 }
 
 @Composable
-private fun ChatMessageItem(message: ChatMessage) {
+private fun ChatMessageItem(
+    message: ChatMessage,
+    onToggleReasoning: () -> Unit
+) {
     val isUserMessage = message.role == MessageRole.User
 
     Column(
@@ -446,54 +524,164 @@ private fun ChatMessageItem(message: ChatMessage) {
             }
         } else {
             if (message.reasoningContent.isNotBlank()) {
-                var isThinkingExpanded by remember(message.reasoningContent) { mutableStateOf(true) }
-                Surface(
+                Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clickable { isThinkingExpanded = !isThinkingExpanded },
-                    shape = RoundedCornerShape(12.dp),
-                    color = AppColors.SettingsBackground
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null,
+                            onClick = onToggleReasoning
+                        )
                 ) {
-                    Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            text = "思考过程",
+                            color = AppColors.TextTertiary,
+                            fontSize = 12.sp
+                        )
+                        message.reasoningDurationMillis?.let { durationMillis ->
                             Text(
-                                text = "思考过程",
-                                modifier = Modifier.weight(1f),
-                                color = AppColors.TextTertiary,
-                                fontSize = 12.sp
-                            )
-                            Icon(
-                                imageVector = if (isThinkingExpanded) {
-                                    Icons.Default.KeyboardArrowUp
-                                } else {
-                                    Icons.Default.KeyboardArrowDown
-                                },
-                                contentDescription = if (isThinkingExpanded) "折叠思考过程" else "展开思考过程",
-                                tint = AppColors.TextHint,
-                                modifier = Modifier.size(20.dp)
-                            )
-                        }
-                        if (isThinkingExpanded) {
-                            Text(
-                                text = message.reasoningContent,
-                                modifier = Modifier.padding(top = 6.dp),
-                                color = AppColors.TextSecondary,
+                                text = " ${formatDuration(durationMillis)}",
+                                color = AppColors.TextHint,
                                 fontSize = 12.sp
                             )
                         }
+                        Icon(
+                            imageVector = if (message.isReasoningExpanded) {
+                                Icons.Default.KeyboardArrowUp
+                            } else {
+                                Icons.Default.KeyboardArrowDown
+                            },
+                            contentDescription = if (message.isReasoningExpanded) "折叠思考过程" else "展开思考过程",
+                            tint = AppColors.TextHint,
+                            modifier = Modifier
+                                .padding(start = 2.dp)
+                                .size(16.dp)
+                        )
+                    }
+                    if (message.isReasoningExpanded) {
+                        Text(
+                            text = message.reasoningContent,
+                            modifier = Modifier.padding(top = 6.dp),
+                            color = AppColors.TextSecondary,
+                            fontSize = 12.sp
+                        )
                     }
                 }
             }
             if (message.content.isNotBlank()) {
-                Text(
-                    text = message.content,
+                MarkdownText(
+                    markdown = message.content,
                     modifier = Modifier.padding(top = if (message.reasoningContent.isBlank()) 0.dp else 10.dp),
-                    color = AppColors.TextPrimary,
-                    fontSize = 16.sp
                 )
             }
         }
     }
+}
+
+/**
+ * 轻量 Markdown：块级处理标题、列表和分割线；行内处理粗体、斜体和代码。
+ * 不引入第三方库，避免把模型输出的 `---` 当作普通正文显示。
+ */
+@Composable
+private fun MarkdownText(markdown: String, modifier: Modifier = Modifier) {
+    Column(modifier = modifier) {
+        markdown.lines().forEach { line ->
+            val trimmedLine = line.trim()
+            when {
+                trimmedLine.isHorizontalRule() -> {
+                    HorizontalDivider(
+                        modifier = Modifier.padding(vertical = 12.dp),
+                        color = AppColors.TextHint
+                    )
+                }
+
+                trimmedLine.isMarkdownHeading() -> {
+                    MarkdownInlineText(
+                        markdown = trimmedLine.dropWhile { it == '#' }.trimStart(),
+                        modifier = Modifier.padding(top = 8.dp, bottom = 4.dp),
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+
+                trimmedLine.isMarkdownBullet() -> {
+                    Row(modifier = Modifier.padding(top = 2.dp)) {
+                        Text("•", color = AppColors.TextPrimary, fontSize = 16.sp)
+                        MarkdownInlineText(
+                            markdown = trimmedLine.drop(2),
+                            modifier = Modifier.padding(start = 8.dp)
+                        )
+                    }
+                }
+
+                trimmedLine.isEmpty() -> Text("", modifier = Modifier.height(8.dp))
+                else -> MarkdownInlineText(markdown = line)
+            }
+        }
+    }
+}
+
+@Composable
+private fun MarkdownInlineText(
+    markdown: String,
+    modifier: Modifier = Modifier,
+    fontWeight: FontWeight? = null
+) {
+    val text = remember(markdown) { markdown.toMarkdownAnnotatedString() }
+    Text(
+        text = text,
+        modifier = modifier,
+        color = AppColors.TextPrimary,
+        fontSize = 16.sp,
+        fontWeight = fontWeight
+    )
+}
+
+private fun String.isHorizontalRule(): Boolean =
+    length >= 3 && all { it == '-' || it == '*' || it == '_' }
+
+private fun String.isMarkdownHeading(): Boolean =
+    startsWith("#") && dropWhile { it == '#' }.startsWith(" ")
+
+private fun String.isMarkdownBullet(): Boolean =
+    (startsWith("- ") || startsWith("* ")) && length > 2
+
+private fun String.toMarkdownAnnotatedString(): AnnotatedString = buildAnnotatedString {
+    val source = this@toMarkdownAnnotatedString
+    var index = 0
+    while (index < source.length) {
+        val marker = when {
+            source.startsWith("**", index) -> "**"
+            source.startsWith("`", index) -> "`"
+            source.startsWith("*", index) -> "*"
+            else -> null
+        }
+        if (marker == null) {
+            append(this@toMarkdownAnnotatedString[index++])
+            continue
+        }
+
+        val contentStart = index + marker.length
+        val contentEnd = source.indexOf(marker, contentStart)
+        if (contentEnd < 0 || contentEnd == contentStart) {
+            append(this@toMarkdownAnnotatedString[index++])
+            continue
+        }
+        val style = when (marker) {
+            "**" -> SpanStyle(fontWeight = FontWeight.SemiBold)
+            "`" -> SpanStyle(fontFamily = FontFamily.Monospace)
+            else -> SpanStyle(fontStyle = androidx.compose.ui.text.font.FontStyle.Italic)
+        }
+        withStyle(style) {
+            append(source.substring(contentStart, contentEnd))
+        }
+        index = contentEnd + marker.length
+    }
+}
+
+private fun formatDuration(durationMillis: Long): String = when {
+    durationMillis < 1_000L -> "${durationMillis}ms"
+    else -> String.format(Locale.US, "%.1fs", durationMillis / 1_000.0)
 }
 
 @Composable
@@ -714,6 +902,13 @@ private fun ConversationSettingsScreen(
                     onClick = {}
                 )
                 SettingsRow(
+                    title = "KV Cache 复用",
+                    summary = generationMetrics?.let { "${it.reusedPromptTokenCount} tokens" } ?: "暂无",
+                    showChevron = false,
+                    clickable = false,
+                    onClick = {}
+                )
+                SettingsRow(
                     title = "Decode",
                     summary = generationMetrics?.let {
                         "${formatTokensPerSecond(it.decodeTokensPerSecond)} tok/s"
@@ -825,11 +1020,11 @@ private fun ConversationSettingsScreen(
             text = {
                 Column {
                     Text(
-                        text = "修改会重建 Native Context 并清空 KV Cache；聊天消息不会删除。",
+                        text = "修改会重建 Native Context 并清空 KV Cache；8K 适合普通多轮，16K 仅建议内存充足的设备。",
                         color = AppColors.TextTertiary,
                         fontSize = 12.sp
                     )
-                    listOf(512, 1024, 2048, 4096).forEach { option ->
+                    listOf(4096, 8192, 12288, 16384).forEach { option ->
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -932,6 +1127,31 @@ private fun ConversationSettingsScreen(
                         color = AppColors.TextTertiary,
                         fontSize = 12.sp
                     )
+                    Text(
+                        text = "预设",
+                        modifier = Modifier.padding(top = 12.dp),
+                        color = AppColors.TextPrimary,
+                        fontSize = 14.sp
+                    )
+                    SamplingPreset.entries.chunked(2).forEach { row ->
+                        Row(modifier = Modifier.fillMaxWidth()) {
+                            row.forEach { preset ->
+                                OutlinedButton(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .padding(end = 6.dp, top = 4.dp),
+                                    onClick = {
+                                        samplingDraft = preset.configFor(nCtx ?: requestedNctx)
+                                    }
+                                ) {
+                                    Text(preset.label, fontSize = 12.sp)
+                                }
+                            }
+                            if (row.size == 1) {
+                                Box(modifier = Modifier.weight(1f))
+                            }
+                        }
+                    }
                     SamplingSlider("Temperature", listOf("0（稳定）" to 0f, "0.2" to 0.2f, "0.7" to 0.7f, "1.0" to 1.0f), samplingDraft.temperature) {
                         samplingDraft = samplingDraft.copy(temperature = it)
                     }
@@ -952,7 +1172,7 @@ private fun ConversationSettingsScreen(
                     }
                     SamplingSlider(
                         title = "Max Tokens",
-                        options = listOf(64, 128, 256, 512)
+                        options = listOf(2048, 4096, 6000)
                             .filter { it < (nCtx ?: requestedNctx) }
                             .map { "$it" to it },
                         selected = samplingDraft.maxTokens

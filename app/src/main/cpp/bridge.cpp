@@ -126,7 +126,7 @@ namespace {
 
             llama_free(context_);
             context_ = nullptr;
-            nextPosition_ = 0;
+            clearCachedTokens();
         }
 
         // 不释放模型权重，只清除当前会话在 Native 中累积的 KV Cache。
@@ -136,7 +136,7 @@ namespace {
             }
 
             llama_memory_clear(llama_get_memory(context_), false);
-            nextPosition_ = 0;
+            clearCachedTokens();
         }
 
         int setThreads(int generationThreads, int batchThreads) {
@@ -276,7 +276,7 @@ namespace {
             return static_cast<int>(tokenize(prompt, true).size());
         }
 
-        int prefill(const std::vector<llama_token> &tokens) {
+        int prefill(const std::vector<llama_token> &tokens, size_t startIndex) {
             if (context_ == nullptr || tokens.empty()) {
                 return 0;
             }
@@ -285,13 +285,14 @@ namespace {
                 return 0;
             }
 
-            // 基础多轮版每次都用完整历史重建 prompt，因此旧 KV Cache 不能复用。
-            llama_memory_clear(llama_get_memory(context_), false);
+            if (startIndex > tokens.size()) {
+                return 0;
+            }
 
             // n_batch 是单次 llama_decode 的上限，不是整个 prompt 的上限。
             // 历史消息可能超过 512 Token，因此分批 Prefill，但 position 必须连续。
             const size_t batchSize = llama_n_batch(context_);
-            for (size_t start = 0; start < tokens.size(); start += batchSize) {
+            for (size_t start = startIndex; start < tokens.size(); start += batchSize) {
                 if (stopRequested_.load()) {
                     return 0;
                 }
@@ -329,7 +330,7 @@ namespace {
                 const SamplingConfig &samplingConfig,
                 const std::function<bool(const std::string &, int)> &onPrompt,
                 const std::function<bool(const std::string &)> &onToken,
-                const std::function<void(int, int64_t, int64_t, int64_t, int64_t)> &onMetrics
+                const std::function<void(int, int, int64_t, int64_t, int64_t, int64_t)> &onMetrics
         ) {
             if (model_ == nullptr || context_ == nullptr || history.empty() || maxTokens <= 0) {
                 return {};
@@ -353,10 +354,22 @@ namespace {
                 return {};
             }
 
+            const size_t reusedPromptTokenCount = commonPrefixLength(cachedTokens_, promptTokens);
+            const bool canReuseCache = !cachedTokens_.empty() &&
+                    reusedPromptTokenCount == cachedTokens_.size();
+            if (!canReuseCache) {
+                // 首轮与历史裁剪、清空消息、System Prompt 变更后的回退路径，都保持
+                // 原先“先清空再完整 Prefill”的行为；只有确认完整前缀一致时才保留 Cache。
+                resetContext();
+            }
+            const size_t prefillStartIndex = canReuseCache
+                    ? reusedPromptTokenCount
+                    : 0;
             const auto prefillStartedAt = Clock::now();
-            if (prefill(promptTokens) != static_cast<int>(promptTokens.size())) {
+            if (prefill(promptTokens, prefillStartIndex) != static_cast<int>(promptTokens.size())) {
                 return {};
             }
+            cachedTokens_ = promptTokens;
             const auto prefillFinishedAt = Clock::now();
             const auto prefillMillis = std::chrono::duration_cast<std::chrono::milliseconds>(
                     prefillFinishedAt - prefillStartedAt
@@ -377,6 +390,9 @@ namespace {
             }
 
             std::string answer;
+            // llama.cpp 的某些 Token 只包含 UTF-8 字符的一部分字节。不能把半个
+            // 中文字符直接交给 JNI 的 NewStringUTF，否则会在 Kotlin 侧变成 '?'。
+            std::string pendingUtf8Piece;
             int generatedTokenCount = 0;
             int64_t firstTokenMillis = -1;
             const auto decodeStartedAt = Clock::now();
@@ -394,6 +410,7 @@ namespace {
 
                 const std::string piece = tokenToPiece(token, false);
                 answer += piece;
+                pendingUtf8Piece += piece;
                 ++generatedTokenCount;
                 if (firstTokenMillis < 0) {
                     firstTokenMillis = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -401,11 +418,15 @@ namespace {
                     ).count();
                 }
 
-                // Native 每采样出一个 Token，就把对应文字片段推回 Kotlin。
-                // 这样 Compose 不必等完整回答生成完才更新页面。
-                if (!piece.empty() && !onToken(piece)) {
+                // 只有累积成完整 UTF-8 文本后才回调 Kotlin；仍保持逐 Token 的流式体验，
+                // 但不会把半个多字节字符转换成问号。
+                if (!pendingUtf8Piece.empty() && isCompleteValidUtf8(pendingUtf8Piece) &&
+                    !onToken(pendingUtf8Piece)) {
                     answer.clear();
                     break;
+                }
+                if (isCompleteValidUtf8(pendingUtf8Piece)) {
+                    pendingUtf8Piece.clear();
                 }
 
                 if (stopRequested_.load()) {
@@ -418,6 +439,7 @@ namespace {
                     answer.clear();
                     break;
                 }
+                cachedTokens_.push_back(token);
             }
 
             llama_sampler_free(sampler);
@@ -430,6 +452,7 @@ namespace {
             ).count();
             onMetrics(
                     generatedTokenCount,
+                    static_cast<int>(prefillStartIndex),
                     prefillMillis,
                     firstTokenMillis < 0 ? totalMillis : firstTokenMillis,
                     decodeMillis,
@@ -557,9 +580,54 @@ namespace {
         }
 
     private:
+        static bool isCompleteValidUtf8(const std::string &text) {
+            for (size_t index = 0; index < text.size();) {
+                const auto first = static_cast<unsigned char>(text[index]);
+                size_t sequenceLength = 0;
+                if ((first & 0x80) == 0) {
+                    sequenceLength = 1;
+                } else if ((first & 0xE0) == 0xC0) {
+                    sequenceLength = 2;
+                } else if ((first & 0xF0) == 0xE0) {
+                    sequenceLength = 3;
+                } else if ((first & 0xF8) == 0xF0) {
+                    sequenceLength = 4;
+                } else {
+                    return false;
+                }
+                if (index + sequenceLength > text.size()) {
+                    return false;
+                }
+                for (size_t offset = 1; offset < sequenceLength; ++offset) {
+                    if ((static_cast<unsigned char>(text[index + offset]) & 0xC0) != 0x80) {
+                        return false;
+                    }
+                }
+                index += sequenceLength;
+            }
+            return true;
+        }
+
+        static size_t commonPrefixLength(
+                const std::vector<llama_token> &first,
+                const std::vector<llama_token> &second) {
+            size_t index = 0;
+            while (index < first.size() && index < second.size() && first[index] == second[index]) {
+                ++index;
+            }
+            return index;
+        }
+
+        void clearCachedTokens() {
+            cachedTokens_.clear();
+            nextPosition_ = 0;
+        }
+
         llama_model *model_ = nullptr;
         llama_context *context_ = nullptr;
         llama_pos nextPosition_ = 0;
+        // Kotlin 消息是事实来源；该前缀仅用于判断 Context 中哪些 Token 可安全复用。
+        std::vector<llama_token> cachedTokens_;
         std::atomic_bool stopRequested_ = false;
     };
 }
@@ -879,7 +947,9 @@ Java_com_arick_androidlocalllmlab_NativeLlmBridge_nativePrefill(
     // C++ 已复制数组，不需要把任何修改回写到 Kotlin IntArray。
     env->ReleaseIntArrayElements(tokenIds, rawTokenIds, JNI_ABORT);
 
-    return runtime->prefill(tokens);
+    // 独立 Prefill 实验从空 Context 开始，不能混用聊天的增量 KV Cache。
+    runtime->resetContext();
+    return runtime->prefill(tokens, 0);
 }
 
 extern "C"
@@ -950,7 +1020,7 @@ Java_com_arick_androidlocalllmlab_NativeLlmBridge_nativeGenerate(
             : env->GetMethodID(callbackClass, "onToken", "(Ljava/lang/String;)V");
     jmethodID onMetricsMethod = callbackClass == nullptr
             ? nullptr
-            : env->GetMethodID(callbackClass, "onMetrics", "(IJJJJ)V");
+            : env->GetMethodID(callbackClass, "onMetrics", "(IIJJJJ)V");
     if (onPromptMethod == nullptr || onTokenMethod == nullptr || onMetricsMethod == nullptr) {
         env->ExceptionClear();
         return env->NewStringUTF("");
@@ -1004,6 +1074,7 @@ Java_com_arick_androidlocalllmlab_NativeLlmBridge_nativeGenerate(
             },
             [env, generationCallback, onMetricsMethod](
                     int generatedTokenCount,
+                    int reusedPromptTokenCount,
                     int64_t prefillMillis,
                     int64_t firstTokenMillis,
                     int64_t decodeMillis,
@@ -1012,6 +1083,7 @@ Java_com_arick_androidlocalllmlab_NativeLlmBridge_nativeGenerate(
                         generationCallback,
                         onMetricsMethod,
                         static_cast<jint>(generatedTokenCount),
+                        static_cast<jint>(reusedPromptTokenCount),
                         static_cast<jlong>(prefillMillis),
                         static_cast<jlong>(firstTokenMillis),
                         static_cast<jlong>(decodeMillis),

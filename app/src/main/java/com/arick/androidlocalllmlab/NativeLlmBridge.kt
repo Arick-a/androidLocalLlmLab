@@ -7,6 +7,7 @@ interface NativeGenerationCallback {
 
     fun onMetrics(
         generatedTokenCount: Int,
+        reusedPromptTokenCount: Int,
         prefillMillis: Long,
         firstTokenMillis: Long,
         decodeMillis: Long,
