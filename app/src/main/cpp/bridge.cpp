@@ -355,16 +355,26 @@ namespace {
             }
 
             const size_t reusedPromptTokenCount = commonPrefixLength(cachedTokens_, promptTokens);
-            const bool canReuseCache = !cachedTokens_.empty() &&
-                    reusedPromptTokenCount == cachedTokens_.size();
-            if (!canReuseCache) {
-                // 首轮与历史裁剪、清空消息、System Prompt 变更后的回退路径，都保持
-                // 原先“先清空再完整 Prefill”的行为；只有确认完整前缀一致时才保留 Cache。
+            size_t prefillStartIndex = 0;
+            if (!cachedTokens_.empty() && reusedPromptTokenCount > 0) {
+                // 新一轮的模板会在上一轮 assistant 文本之后追加 user 标记；Tokenizer 可能
+                // 改变末尾少数 Token 的切分。保留最长公共前缀，删除旧 Cache 的后缀即可。
+                if (reusedPromptTokenCount < cachedTokens_.size() &&
+                    !llama_memory_seq_rm(
+                            llama_get_memory(context_),
+                            0,
+                            static_cast<llama_pos>(reusedPromptTokenCount),
+                            -1
+                    )) {
+                    resetContext();
+                } else {
+                    prefillStartIndex = reusedPromptTokenCount;
+                    nextPosition_ = static_cast<llama_pos>(reusedPromptTokenCount);
+                }
+            } else {
+                // 首轮、历史裁剪或 System Prompt 变化到连首段都不同的情况，完整重建。
                 resetContext();
             }
-            const size_t prefillStartIndex = canReuseCache
-                    ? reusedPromptTokenCount
-                    : 0;
             const auto prefillStartedAt = Clock::now();
             if (prefill(promptTokens, prefillStartIndex) != static_cast<int>(promptTokens.size())) {
                 return {};

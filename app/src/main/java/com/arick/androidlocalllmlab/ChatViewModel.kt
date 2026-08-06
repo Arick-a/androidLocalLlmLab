@@ -2,6 +2,7 @@ package com.arick.androidlocalllmlab
 
 import android.app.Application
 import android.net.Uri
+import android.os.Debug
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
@@ -48,6 +49,25 @@ data class ChatMessage(
     // 从首个思考 Token 到正文开始的真实流式耗时。
     val reasoningDurationMillis: Long? = null
 )
+
+data class MemorySnapshot(
+    val javaUsedBytes: Long,
+    val javaMaxBytes: Long,
+    val nativeAllocatedBytes: Long,
+    val totalPssKb: Int,
+    val nativePssKb: Int
+)
+
+data class RuntimeMemorySnapshots(
+    val beforeLoad: MemorySnapshot? = null,
+    val afterModelLoaded: MemorySnapshot? = null,
+    val afterContextCreated: MemorySnapshot? = null,
+    val afterGeneration: MemorySnapshot? = null,
+    val afterModelReleased: MemorySnapshot? = null
+) {
+    val current: MemorySnapshot?
+        get() = afterModelReleased ?: afterGeneration ?: afterContextCreated ?: afterModelLoaded ?: beforeLoad
+}
 
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private companion object {
@@ -98,6 +118,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _generationMetrics = MutableStateFlow<GenerationMetrics?>(null)
     val generationMetrics: StateFlow<GenerationMetrics?> = _generationMetrics.asStateFlow()
+
+    private val _modelPreparationMetrics = MutableStateFlow<ModelPreparationMetrics?>(null)
+    val modelPreparationMetrics: StateFlow<ModelPreparationMetrics?> = _modelPreparationMetrics.asStateFlow()
+
+    private val _memorySnapshots = MutableStateFlow(RuntimeMemorySnapshots())
+    val memorySnapshots: StateFlow<RuntimeMemorySnapshots> = _memorySnapshots.asStateFlow()
 
     private val _isGenerating = MutableStateFlow(false)
     val isGenerating: StateFlow<Boolean> = _isGenerating.asStateFlow()
@@ -156,16 +182,25 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     private suspend fun prepareModel(modelFile: File) {
         _uiState.value = ChatUiState.Preparing("正在加载模型并创建 Context…")
-        val actualNctx = withContext(Dispatchers.Default) {
+        val beforeLoad = takeMemorySnapshot()
+        var afterModelLoaded: MemorySnapshot? = null
+        val preparationMetrics = withContext(Dispatchers.Default) {
             // Native 模型加载与 Context 分配可能耗时，不能阻塞 Compose 主线程。
             runtime.prepareModel(
                 modelPath = modelFile.absolutePath,
                 requestedNctx = _requestedNctx.value,
-                cpuThreads = _cpuThreads.value
+                cpuThreads = _cpuThreads.value,
+                onModelLoaded = { afterModelLoaded = takeMemorySnapshot() }
             )
         }
 
-        check(actualNctx > 0) { "模型或 Context 创建失败" }
+        check(preparationMetrics.actualNctx > 0) { "模型或 Context 创建失败" }
+        _modelPreparationMetrics.value = preparationMetrics
+        _memorySnapshots.value = RuntimeMemorySnapshots(
+            beforeLoad = beforeLoad,
+            afterModelLoaded = afterModelLoaded,
+            afterContextCreated = takeMemorySnapshot()
+        )
         val modelDescription = withContext(Dispatchers.Default) {
             runtime.modelDescription()
         }
@@ -183,7 +218,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         _generationProgress.value = null
         _generationMetrics.value = null
         _generationError.value = null
-        _uiState.value = ChatUiState.Ready(modelFile, actualNctx, modelDescription, modelName)
+        _uiState.value = ChatUiState.Ready(
+            modelFile,
+            preparationMetrics.actualNctx,
+            modelDescription,
+            modelName
+        )
     }
 
     fun send(prompt: String) {
@@ -278,6 +318,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         },
                         onMetrics = { metrics ->
                             _generationMetrics.value = metrics
+                            _memorySnapshots.value = _memorySnapshots.value.copy(
+                                afterGeneration = takeMemorySnapshot(),
+                                afterModelReleased = null
+                            )
                         }
                     )
                     // Native 返回的是完整 UTF-8 原始回答。流式回调即使遇到异常字节片段，
@@ -602,6 +646,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 // 释放顺序由 NativeRuntime 保证：Context -> Model -> llama backend。
                 runtime.close()
             }
+            _memorySnapshots.value = _memorySnapshots.value.copy(
+                afterModelReleased = takeMemorySnapshot()
+            )
             selectedModelStore.clear()
             _messages.value = emptyList()
             clearLastPromptState()
@@ -616,6 +663,19 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         _trimmedHistoryTurnCount.value = 0
         _generationProgress.value = null
         _generationMetrics.value = null
+    }
+
+    private fun takeMemorySnapshot(): MemorySnapshot {
+        val runtime = Runtime.getRuntime()
+        val memoryInfo = Debug.MemoryInfo()
+        Debug.getMemoryInfo(memoryInfo)
+        return MemorySnapshot(
+            javaUsedBytes = runtime.totalMemory() - runtime.freeMemory(),
+            javaMaxBytes = runtime.maxMemory(),
+            nativeAllocatedBytes = Debug.getNativeHeapAllocatedSize(),
+            totalPssKb = memoryInfo.totalPss,
+            nativePssKb = memoryInfo.nativePss
+        )
     }
 
     override fun onCleared() {

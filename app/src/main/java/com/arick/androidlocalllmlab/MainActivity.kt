@@ -107,6 +107,8 @@ private fun ChatScreen(viewModel: ChatViewModel) {
     val thinkingEnabled by viewModel.thinkingEnabled.collectAsState()
     val generationProgress by viewModel.generationProgress.collectAsState()
     val generationMetrics by viewModel.generationMetrics.collectAsState()
+    val modelPreparationMetrics by viewModel.modelPreparationMetrics.collectAsState()
+    val memorySnapshots by viewModel.memorySnapshots.collectAsState()
     val isGenerating by viewModel.isGenerating.collectAsState()
     val isStopRequested by viewModel.isStopRequested.collectAsState()
     val generationError by viewModel.generationError.collectAsState()
@@ -149,6 +151,8 @@ private fun ChatScreen(viewModel: ChatViewModel) {
             supportsQwen3ThinkingSwitch = supportsQwen3ThinkingSwitch,
             thinkingEnabled = thinkingEnabled,
             generationMetrics = generationMetrics,
+            modelPreparationMetrics = modelPreparationMetrics,
+            memorySnapshots = memorySnapshots,
             isGenerating = isGenerating,
             onSystemPromptChange = viewModel::updateSystemPrompt,
             onContextWindowChange = viewModel::updateContextWindow,
@@ -684,6 +688,13 @@ private fun formatDuration(durationMillis: Long): String = when {
     else -> String.format(Locale.US, "%.1fs", durationMillis / 1_000.0)
 }
 
+private fun formatBytes(bytes: Long): String = when {
+    bytes < 1024L * 1024L -> "${bytes / 1024} KB"
+    else -> String.format(Locale.US, "%.1f MB", bytes / (1024.0 * 1024.0))
+}
+
+private fun formatKb(kb: Int): String = formatBytes(kb.toLong() * 1024L)
+
 @Composable
 private fun HistoryDrawer(onClose: () -> Unit) {
     ModalDrawerSheet(
@@ -727,6 +738,8 @@ private fun ConversationSettingsScreen(
     supportsQwen3ThinkingSwitch: Boolean,
     thinkingEnabled: Boolean,
     generationMetrics: GenerationMetrics?,
+    modelPreparationMetrics: ModelPreparationMetrics?,
+    memorySnapshots: RuntimeMemorySnapshots,
     isGenerating: Boolean,
     onSystemPromptChange: (String) -> Unit,
     onContextWindowChange: (Int) -> Unit,
@@ -887,6 +900,57 @@ private fun ConversationSettingsScreen(
                 title = "性能",
                 modifier = Modifier.padding(top = 28.dp)
             ) {
+                SettingsRow(
+                    title = "模型加载",
+                    summary = modelPreparationMetrics?.modelLoadMillis?.let { "$it ms" } ?: "暂无",
+                    showChevron = false,
+                    clickable = false,
+                    onClick = {}
+                )
+                SettingsRow(
+                    title = "Context 创建",
+                    summary = modelPreparationMetrics?.contextCreateMillis?.let { "$it ms" } ?: "暂无",
+                    showChevron = false,
+                    clickable = false,
+                    onClick = {}
+                )
+                SettingsRow(
+                    title = "Java Heap",
+                    summary = memorySnapshots.current?.let {
+                        "${formatBytes(it.javaUsedBytes)} / ${formatBytes(it.javaMaxBytes)}"
+                    } ?: "暂无",
+                    showChevron = false,
+                    clickable = false,
+                    onClick = {}
+                )
+                SettingsRow(
+                    title = "Native Heap",
+                    summary = memorySnapshots.current?.nativeAllocatedBytes?.let(::formatBytes) ?: "暂无",
+                    showChevron = false,
+                    clickable = false,
+                    onClick = {}
+                )
+                SettingsRow(
+                    title = "Native PSS",
+                    summary = memorySnapshots.current?.nativePssKb?.let(::formatKb) ?: "暂无",
+                    showChevron = false,
+                    clickable = false,
+                    onClick = {}
+                )
+                SettingsRow(
+                    title = "模型后 Native PSS",
+                    summary = memorySnapshots.afterModelLoaded?.nativePssKb?.let(::formatKb) ?: "暂无",
+                    showChevron = false,
+                    clickable = false,
+                    onClick = {}
+                )
+                SettingsRow(
+                    title = "Context 后 Native PSS",
+                    summary = memorySnapshots.afterContextCreated?.nativePssKb?.let(::formatKb) ?: "暂无",
+                    showChevron = false,
+                    clickable = false,
+                    onClick = {}
+                )
                 SettingsRow(
                     title = "首 Token 等待",
                     summary = generationMetrics?.firstTokenMillis?.let { "$it ms" } ?: "暂无",

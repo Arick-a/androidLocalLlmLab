@@ -1,5 +1,13 @@
 package com.arick.androidlocalllmlab
 
+import android.os.SystemClock
+
+data class ModelPreparationMetrics(
+    val modelLoadMillis: Long,
+    val contextCreateMillis: Long,
+    val actualNctx: Int
+)
+
 class LocalLlmRuntime : AutoCloseable {
     private var nativeHandle: Long = 0L
     private var cpuThreads: Int = 1
@@ -82,25 +90,39 @@ class LocalLlmRuntime : AutoCloseable {
     fun prepareModel(
         modelPath: String,
         requestedNctx: Int,
-        cpuThreads: Int
-    ): Int {
+        cpuThreads: Int,
+        onModelLoaded: () -> Unit = {}
+    ): ModelPreparationMetrics {
         this.cpuThreads = cpuThreads
         createIfNeeded()
 
         // 切换模型前先释放旧 Context 和旧模型，避免旧 KV Cache 和权重继续占用 Native 内存。
         unloadModel()
 
+        val modelLoadStartedAt = SystemClock.elapsedRealtime()
         if (!loadModel(modelPath)) {
-            return 0
+            return ModelPreparationMetrics(
+                modelLoadMillis = SystemClock.elapsedRealtime() - modelLoadStartedAt,
+                contextCreateMillis = 0L,
+                actualNctx = 0
+            )
         }
+        val modelLoadMillis = SystemClock.elapsedRealtime() - modelLoadStartedAt
+        onModelLoaded()
 
+        val contextCreateStartedAt = SystemClock.elapsedRealtime()
         val actualNctx = createContext(requestedNctx)
+        val contextCreateMillis = SystemClock.elapsedRealtime() - contextCreateStartedAt
         if (actualNctx == 0) {
             // Context 创建失败时同步卸载模型，防止 UI 误以为模型已经可推理。
             unloadModel()
         }
 
-        return actualNctx
+        return ModelPreparationMetrics(
+            modelLoadMillis = modelLoadMillis,
+            contextCreateMillis = contextCreateMillis,
+            actualNctx = actualNctx
+        )
     }
 
     fun recreateContext(requestedNctx: Int): Int {
