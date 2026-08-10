@@ -1,0 +1,6 @@
+# 复制为项目根目录的 key.properties 后填写；该真实文件已被 Git 忽略。
+# storeFile 可使用绝对路径，也可使用相对项目根目录的路径。
+storeFile=keystore/release.jks
+storePassword=
+keyAlias=
+keyPassword=

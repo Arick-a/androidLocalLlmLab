@@ -14,6 +14,15 @@ val localProperties = Properties().apply {
 val tavilyApiKey = localProperties.getProperty("tavily.api.key", "")
     .replace("\\", "\\\\")
     .replace("\"", "\\\"")
+val appVersionName = "1.0.0"
+val appVersionCode = 1000
+val signingPropertiesFile = rootProject.file("key.properties")
+val signingProperties = Properties().apply {
+    if (signingPropertiesFile.isFile) {
+        signingPropertiesFile.inputStream().use(::load)
+    }
+}
+val hasReleaseSigning = signingPropertiesFile.isFile
 
 android {
     namespace = "com.arick.androidlocalllmlab"
@@ -29,8 +38,8 @@ android {
         applicationId = "com.arick.androidlocalllmlab"
         minSdk = 24
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = appVersionCode
+        versionName = appVersionName
         // local.properties 已被 Git 忽略；仅用于个人 Debug 实验，不能作为正式发版的密钥方案。
         buildConfigField("String", "TAVILY_API_KEY", "\"$tavilyApiKey\"")
         ndk {
@@ -50,10 +59,22 @@ android {
             version = "3.22.1"
         }
     }
+    signingConfigs {
+        if (hasReleaseSigning) {
+            create("release") {
+                storeFile = rootProject.file(signingProperties.getProperty("storeFile"))
+                storePassword = signingProperties.getProperty("storePassword")
+                keyAlias = signingProperties.getProperty("keyAlias")
+                keyPassword = signingProperties.getProperty("keyPassword")
+            }
+        }
+    }
 
     buildTypes {
         release {
-            signingConfig = signingConfigs.getByName("debug")
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.getByName("release")
+            }
             optimization {
                 enable = false
             }
@@ -66,6 +87,15 @@ android {
     buildFeatures {
         compose = true
         buildConfig = true
+    }
+}
+
+androidComponents {
+    onVariants(selector().all()) { variant ->
+        val buildType = variant.buildType
+        variant.outputs.forEach { output ->
+            output.outputFileName.set("llmLab-$buildType-v$appVersionCode.apk")
+        }
     }
 }
 
