@@ -47,8 +47,16 @@ data class ChatMessage(
     // 展开状态属于会话 UI 数据，不能交给 Composable remember，否则流式内容变化或页面切换会丢失。
     val isReasoningExpanded: Boolean = true,
     // 从首个思考 Token 到正文开始的真实流式耗时。
-    val reasoningDurationMillis: Long? = null
+    val reasoningDurationMillis: Long? = null,
+    // 工具执行记录只来自 Kotlin 的实际调用，不展示模型自行生成的“思考”。
+    val agentTrace: List<AgentTraceItem> = emptyList(),
+    val isAgentTraceExpanded: Boolean = false,
+    val agentDurationMillis: Long? = null,
+    // 搜索来源由工具结果提供，不能依赖模型在正文中自行拼接超长 URL。
+    val sourceLinks: List<SourceLink> = emptyList()
 )
+
+data class AgentTraceItem(val text: String)
 
 data class MemorySnapshot(
     val javaUsedBytes: Long,
@@ -76,6 +84,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     // Runtime 持有 JNI 返回的 nativeHandle，生命周期与 ViewModel 一致。
     private val runtime = LocalLlmRuntime()
+    private val toolExecutor = AndroidToolExecutor(application)
     private val modelFileImporter = ModelFileImporter(application)
     private val selectedModelStore = SelectedModelStore(application)
 
@@ -239,7 +248,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         // 因而不会传给 Native 作为 prompt 的一部分。
         val visibleHistory = _messages.value.filter { it.content.isNotBlank() }
         val actualNctx = (_uiState.value as? ChatUiState.Ready)?.nCtx ?: return
-        val systemPrompt = _systemPrompt.value.trim().takeIf { it.isNotEmpty() }
+        val systemPrompt = buildFunctionCallingSystemPrompt(
+            _systemPrompt.value.trim().takeIf { it.isNotEmpty() }
+        )
         val inferenceConfig = _inferenceConfig.value
         val nativeUserPrompt = prompt.withQwen3ThinkingInstruction()
         _messages.value = visibleHistory + ChatMessage(
@@ -258,6 +269,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         runtime.resetStopRequest()
         _isStopRequested.value = false
         _isGenerating.value = true
+        val generationStartedAtNanos = System.nanoTime()
 
         viewModelScope.launch {
             try {
@@ -270,78 +282,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         reservedOutputTokens = inferenceConfig.maxTokens
                     )
                     _trimmedHistoryTurnCount.value = trimmedHistory.droppedTurnCount
-
-                    var assistantRawContent = ""
-                    var templateStartsThinking = false
-                    var reasoningStartedAtNanos: Long? = null
-                    var reasoningFinishedAtNanos: Long? = null
-                    val generatedAnswer = runtime.generate(
-                        messages = trimmedHistory.messages,
+                    runFunctionCallingLoop(
+                        initialMessages = trimmedHistory.messages,
                         inferenceConfig = inferenceConfig,
-                        onPrompt = { finalPrompt, tokenCount ->
-                            _finalPrompt.value = finalPrompt
-                            _promptTokenCount.value = tokenCount
-                            _generationProgress.value = "正在理解 $tokenCount tokens…"
-                            templateStartsThinking = finalPrompt.trimEnd().endsWith("<think>")
-                        },
-                        onToken = { piece ->
-                            _generationProgress.value = "正在生成回复…"
-                            assistantRawContent += piece
-                            val assistantParts = splitAssistantResponse(
-                                rawContent = assistantRawContent,
-                                templateStartsThinking = templateStartsThinking
-                            )
-                            val nowNanos = System.nanoTime()
-                            val reasoningDurationMillis = if (assistantParts.reasoning.isNotBlank()) {
-                                val startedAt = reasoningStartedAtNanos ?: nowNanos.also {
-                                    reasoningStartedAtNanos = it
-                                }
-                                if (assistantParts.answer.isNotBlank() && reasoningFinishedAtNanos == null) {
-                                    reasoningFinishedAtNanos = nowNanos
-                                }
-                                ((reasoningFinishedAtNanos ?: nowNanos) - startedAt) / 1_000_000
-                            } else {
-                                null
-                            }
-                            val currentMessages = _messages.value
-                            _messages.value = currentMessages.mapIndexed { index, message ->
-                                if (index == currentMessages.lastIndex) {
-                                    message.copy(
-                                        content = assistantParts.answer,
-                                        reasoningContent = assistantParts.reasoning,
-                                        reasoningDurationMillis = reasoningDurationMillis
-                                    )
-                                } else {
-                                    message
-                                }
-                            }
-                        },
-                        onMetrics = { metrics ->
-                            _generationMetrics.value = metrics
-                            _memorySnapshots.value = _memorySnapshots.value.copy(
-                                afterGeneration = takeMemorySnapshot(),
-                                afterModelReleased = null
-                            )
-                        }
+                        nCtx = actualNctx
                     )
-                    // Native 返回的是完整 UTF-8 原始回答。流式回调即使遇到异常字节片段，
-                    // 结束后也必须以完整结果回填，不能把临时显示的乱码写入会话历史。
-                    val finalAssistantParts = splitAssistantResponse(
-                        rawContent = generatedAnswer,
-                        templateStartsThinking = templateStartsThinking
-                    )
-                    val currentMessages = _messages.value
-                    _messages.value = currentMessages.mapIndexed { index, message ->
-                        if (index == currentMessages.lastIndex) {
-                            message.copy(
-                                content = finalAssistantParts.answer,
-                                reasoningContent = finalAssistantParts.reasoning
-                            )
-                        } else {
-                            message
-                        }
-                    }
-                    generatedAnswer
                 }
                 if (answer.isBlank() && !_isStopRequested.value) {
                     error("模型没有返回内容")
@@ -349,12 +294,195 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             } catch (error: Throwable) {
                 _generationError.value = error.message ?: "生成失败"
             } finally {
+                finishLatestAssistantAgentTrace(generationStartedAtNanos)
                 _generationProgress.value = null
                 _isGenerating.value = false
                 _isStopRequested.value = false
             }
         }
     }
+
+    private fun runFunctionCallingLoop(
+        initialMessages: List<ChatMessage>,
+        inferenceConfig: InferenceConfig,
+        nCtx: Int
+    ): String {
+        var messagesForModel = initialMessages
+        repeat(FunctionCalling.maxToolCalls + 1) { attempt ->
+            val promptTokenCount = runtime.countChatPromptTokens(messagesForModel)
+            val availableOutputTokens = nCtx - promptTokenCount
+            check(availableOutputTokens >= 128) {
+                "工具结果加入后可用输出空间仅剩 $availableOutputTokens tokens，请缩短问题或清空部分历史"
+            }
+            // 首轮历史裁剪仍按用户设置的 maxTokens 留足空间；工具结果加入后，
+            // 最终回答按 Context 剩余空间自动收缩，不能因固定预留 2048 而直接失败。
+            val effectiveInferenceConfig = inferenceConfig.copy(
+                maxTokens = minOf(inferenceConfig.maxTokens, availableOutputTokens)
+            )
+            val generatedAnswer = generateForCurrentTurn(messagesForModel, effectiveInferenceConfig)
+            if (_isStopRequested.value) {
+                return generatedAnswer
+            }
+
+            val toolCall = FunctionCalling.parseToolCall(generatedAnswer)
+                ?: return generatedAnswer
+            if (attempt == FunctionCalling.maxToolCalls) {
+                error("工具调用次数达到上限")
+            }
+
+            // 工具 JSON 只是中间协议，不应留在聊天页；下一次生成继续使用同一个占位 AI 消息。
+            replaceLatestAssistantMessage(AssistantResponseParts(reasoning = "", answer = ""), null)
+            appendLatestAssistantAgentTrace(toolCall.traceDescription())
+            _generationProgress.value = "正在执行工具：${toolCall.name}…"
+            val toolResult = toolExecutor.execute(toolCall) { progress ->
+                _generationProgress.value = progress
+                appendLatestAssistantAgentTrace(progress)
+            }
+            val toolResultText = when (toolResult) {
+                is ToolResult.Success -> {
+                    appendLatestAssistantAgentTrace("工具执行成功：${toolCall.name}")
+                    appendLatestAssistantSources(toolResult.sources)
+                    toolResult.content
+                }
+                is ToolResult.Failure -> {
+                    appendLatestAssistantAgentTrace("工具执行失败：${toolResult.message}")
+                    "工具执行失败：${toolResult.message}"
+                }
+            }
+            val generatedParts = splitAssistantResponse(generatedAnswer, templateStartsThinking = false)
+            messagesForModel = messagesForModel + listOf(
+                ChatMessage(
+                    role = MessageRole.Assistant,
+                    content = generatedParts.answer,
+                    reasoningContent = generatedParts.reasoning
+                ),
+                ChatMessage(
+                    MessageRole.User,
+                    "工具执行结果：$toolResultText。请基于该结果正常回答用户；除非确有必要，否则不要再次调用工具。"
+                )
+            )
+        }
+        error("工具调用流程异常结束")
+    }
+
+    private fun generateForCurrentTurn(
+        messages: List<ChatMessage>,
+        inferenceConfig: InferenceConfig
+    ): String {
+        var assistantRawContent = ""
+        var templateStartsThinking = false
+        var shouldRenderAssistant = false
+        var reasoningStartedAtNanos: Long? = null
+        var reasoningFinishedAtNanos: Long? = null
+        val generatedAnswer = runtime.generate(
+            messages = messages,
+            inferenceConfig = inferenceConfig,
+            onPrompt = { finalPrompt, tokenCount ->
+                _finalPrompt.value = finalPrompt
+                _promptTokenCount.value = tokenCount
+                _generationProgress.value = "正在理解 $tokenCount tokens…"
+                templateStartsThinking = finalPrompt.trimEnd().endsWith("<think>")
+            },
+            onToken = { piece ->
+                _generationProgress.value = "正在生成回复…"
+                assistantRawContent += piece
+                if (!shouldRenderAssistant) {
+                    if (FunctionCalling.shouldDeferToolRendering(assistantRawContent)) {
+                        return@generate
+                    }
+                    // 普通回答已被识别：把此前暂存的片段一次补上，之后继续流式刷新。
+                    shouldRenderAssistant = true
+                }
+                val assistantParts = splitAssistantResponse(assistantRawContent, templateStartsThinking)
+                val nowNanos = System.nanoTime()
+                val durationMillis = assistantParts.reasoning.takeIf { it.isNotBlank() }?.let {
+                    val startedAt = reasoningStartedAtNanos ?: nowNanos.also { timestamp ->
+                        reasoningStartedAtNanos = timestamp
+                    }
+                    if (assistantParts.answer.isNotBlank() && reasoningFinishedAtNanos == null) {
+                        reasoningFinishedAtNanos = nowNanos
+                    }
+                    ((reasoningFinishedAtNanos ?: nowNanos) - startedAt) / 1_000_000
+                }
+                replaceLatestAssistantMessage(assistantParts, durationMillis)
+            },
+            onMetrics = { metrics ->
+                _generationMetrics.value = metrics
+                _memorySnapshots.value = _memorySnapshots.value.copy(
+                    afterGeneration = takeMemorySnapshot(),
+                    afterModelReleased = null
+                )
+            }
+        )
+        // Native 返回完整 UTF-8；普通回答以它回填，避免临时流式片段遗留乱码。
+        // 工具 JSON 只作为协议，不写入气泡，随后由 runFunctionCallingLoop 执行。
+        if (FunctionCalling.parseToolCall(generatedAnswer) == null) {
+            replaceLatestAssistantMessage(
+                splitAssistantResponse(generatedAnswer, templateStartsThinking),
+                null
+            )
+        }
+        return generatedAnswer
+    }
+
+    private fun replaceLatestAssistantMessage(
+        parts: AssistantResponseParts,
+        reasoningDurationMillis: Long?
+    ) {
+        val currentMessages = _messages.value
+        _messages.value = currentMessages.mapIndexed { index, message ->
+            if (index == currentMessages.lastIndex) {
+                message.copy(
+                    content = parts.answer,
+                    reasoningContent = parts.reasoning,
+                    reasoningDurationMillis = reasoningDurationMillis ?: message.reasoningDurationMillis
+                )
+            } else {
+                message
+            }
+        }
+    }
+
+    private fun appendLatestAssistantAgentTrace(text: String) {
+        val currentMessages = _messages.value
+        _messages.value = currentMessages.mapIndexed { index, message ->
+            if (index == currentMessages.lastIndex) {
+                message.copy(agentTrace = message.agentTrace + AgentTraceItem(text))
+            } else {
+                message
+            }
+        }
+    }
+
+    private fun finishLatestAssistantAgentTrace(startedAtNanos: Long) {
+        val currentMessages = _messages.value
+        _messages.value = currentMessages.mapIndexed { index, message ->
+            if (index == currentMessages.lastIndex && message.agentTrace.isNotEmpty()) {
+                message.copy(agentDurationMillis = (System.nanoTime() - startedAtNanos) / 1_000_000)
+            } else {
+                message
+            }
+        }
+    }
+
+    private fun appendLatestAssistantSources(sources: List<SourceLink>) {
+        if (sources.isEmpty()) {
+            return
+        }
+        val currentMessages = _messages.value
+        _messages.value = currentMessages.mapIndexed { index, message ->
+            if (index == currentMessages.lastIndex) {
+                message.copy(sourceLinks = (message.sourceLinks + sources).distinctBy(SourceLink::url))
+            } else {
+                message
+            }
+        }
+    }
+
+    private fun buildFunctionCallingSystemPrompt(userSystemPrompt: String?): String = listOfNotNull(
+        userSystemPrompt,
+        FunctionCalling.systemInstruction
+    ).joinToString("\n\n")
 
     /**
      * 从最近的完整 user/assistant 轮次开始向前保留。每次尝试加入一轮时，都让
@@ -446,6 +574,19 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         _messages.value = _messages.value.mapIndexed { index, message ->
             if (index == messageIndex && message.reasoningContent.isNotBlank()) {
                 message.copy(isReasoningExpanded = !message.isReasoningExpanded)
+            } else {
+                message
+            }
+        }
+    }
+
+    fun toggleAgentTrace(messageIndex: Int) {
+        if (messageIndex !in _messages.value.indices) {
+            return
+        }
+        _messages.value = _messages.value.mapIndexed { index, message ->
+            if (index == messageIndex && message.agentTrace.isNotEmpty()) {
+                message.copy(isAgentTraceExpanded = !message.isAgentTraceExpanded)
             } else {
                 message
             }
@@ -593,6 +734,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val reasoning: String,
         val answer: String
     )
+
+    private fun ToolCall.traceDescription(): String = when (name) {
+        "get_weather" -> "调用天气工具：${arguments.optString("city").trim()}"
+        "web_search" -> "调用网页搜索：${arguments.optString("query").trim()}"
+        "open_settings" -> "调用系统设置：${arguments.optString("page").trim()}"
+        else -> "调用工具：$name"
+    }
 
     fun stopGenerating() {
         if (!_isGenerating.value || _isStopRequested.value) {

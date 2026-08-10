@@ -1,6 +1,8 @@
 package com.arick.androidlocalllmlab
 
 import android.os.Bundle
+import android.content.Intent
+import android.net.Uri
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -60,6 +62,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.TextStyle
@@ -235,7 +238,8 @@ private fun ChatScreen(viewModel: ChatViewModel) {
                             isStopRequested = isStopRequested,
                             generationProgress = generationProgress,
                             errorMessage = generationError,
-                            onToggleReasoning = viewModel::toggleReasoning
+                            onToggleReasoning = viewModel::toggleReasoning,
+                            onToggleAgentTrace = viewModel::toggleAgentTrace
                         )
 
                         is ChatUiState.Error -> EmptyState(
@@ -404,7 +408,8 @@ private fun ChatContent(
     isStopRequested: Boolean,
     generationProgress: String?,
     errorMessage: String?,
-    onToggleReasoning: (Int) -> Unit
+    onToggleReasoning: (Int) -> Unit,
+    onToggleAgentTrace: (Int) -> Unit
 ) {
     val scrollState = rememberScrollState()
     val coroutineScope = rememberCoroutineScope()
@@ -444,7 +449,8 @@ private fun ChatContent(
             if (message.content.isNotBlank() || message.reasoningContent.isNotBlank()) {
                 ChatMessageItem(
                     message = message,
-                    onToggleReasoning = { onToggleReasoning(index) }
+                    onToggleReasoning = { onToggleReasoning(index) },
+                    onToggleAgentTrace = { onToggleAgentTrace(index) }
                 )
             }
         }
@@ -502,7 +508,8 @@ private fun ChatContent(
 @Composable
 private fun ChatMessageItem(
     message: ChatMessage,
-    onToggleReasoning: () -> Unit
+    onToggleReasoning: () -> Unit,
+    onToggleAgentTrace: () -> Unit
 ) {
     val isUserMessage = message.role == MessageRole.User
 
@@ -527,6 +534,49 @@ private fun ChatMessageItem(
                 )
             }
         } else {
+            if (message.agentTrace.isNotEmpty()) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null,
+                            onClick = onToggleAgentTrace
+                        )
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            text = "执行过程${message.agentDurationMillis?.let { " · ${formatDuration(it)}" } ?: ""}",
+                            color = AppColors.TextTertiary,
+                            fontSize = 12.sp
+                        )
+                        Icon(
+                            imageVector = if (message.isAgentTraceExpanded) {
+                                Icons.Default.KeyboardArrowUp
+                            } else {
+                                Icons.Default.KeyboardArrowDown
+                            },
+                            contentDescription = if (message.isAgentTraceExpanded) "折叠执行过程" else "展开执行过程",
+                            tint = AppColors.TextHint,
+                            modifier = Modifier
+                                .padding(start = 2.dp)
+                                .size(16.dp)
+                        )
+                    }
+                    if (message.isAgentTraceExpanded) {
+                        Column(modifier = Modifier.padding(top = 6.dp)) {
+                            message.agentTrace.forEach { item ->
+                                Text(
+                                    text = "• ${item.text}",
+                                    color = AppColors.TextSecondary,
+                                    fontSize = 12.sp,
+                                    modifier = Modifier.padding(bottom = 4.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
             if (message.reasoningContent.isNotBlank()) {
                 Column(
                     modifier = Modifier
@@ -576,9 +626,43 @@ private fun ChatMessageItem(
             if (message.content.isNotBlank()) {
                 MarkdownText(
                     markdown = message.content,
-                    modifier = Modifier.padding(top = if (message.reasoningContent.isBlank()) 0.dp else 10.dp),
+                    modifier = Modifier.padding(
+                        top = if (message.reasoningContent.isBlank() && message.agentTrace.isEmpty()) 0.dp else 10.dp
+                    ),
                 )
             }
+            if (message.sourceLinks.isNotEmpty()) {
+                SourceLinks(message.sourceLinks)
+            }
+        }
+    }
+}
+
+@Composable
+private fun SourceLinks(sources: List<SourceLink>) {
+    val context = LocalContext.current
+    Column(modifier = Modifier.padding(top = 12.dp)) {
+        Text(
+            text = "来源",
+            color = AppColors.TextTertiary,
+            fontSize = 12.sp
+        )
+        sources.forEach { source ->
+            Text(
+                text = "• ${source.title}",
+                color = AppColors.TextSecondary,
+                fontSize = 12.sp,
+                modifier = Modifier
+                    .padding(top = 4.dp)
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null
+                    ) {
+                        runCatching {
+                            context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(source.url)))
+                        }
+                    }
+            )
         }
     }
 }

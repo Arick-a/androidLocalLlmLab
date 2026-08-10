@@ -1,7 +1,19 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
 }
+
+val localProperties = Properties().apply {
+    val localPropertiesFile = rootProject.file("local.properties")
+    if (localPropertiesFile.isFile) {
+        localPropertiesFile.inputStream().use(::load)
+    }
+}
+val tavilyApiKey = localProperties.getProperty("tavily.api.key", "")
+    .replace("\\", "\\\\")
+    .replace("\"", "\\\"")
 
 android {
     namespace = "com.arick.androidlocalllmlab"
@@ -19,6 +31,8 @@ android {
         targetSdk = 36
         versionCode = 1
         versionName = "1.0"
+        // local.properties 已被 Git 忽略；仅用于个人 Debug 实验，不能作为正式发版的密钥方案。
+        buildConfigField("String", "TAVILY_API_KEY", "\"$tavilyApiKey\"")
         ndk {
             abiFilters += "arm64-v8a"
         }
@@ -51,6 +65,7 @@ android {
     }
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 }
 
