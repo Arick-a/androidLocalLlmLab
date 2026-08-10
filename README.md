@@ -156,4 +156,3 @@ tavily.api.key=你的_Tavily_Key
 - [llama.cpp](https://github.com/ggml-org/llama.cpp)
 - [Open-Meteo](https://open-meteo.com/)
 - [Tavily](https://tavily.com/)
-- README 的信息组织参考 [Google AI Edge Gallery](https://github.com/google-ai-edge/gallery)
