@@ -28,14 +28,90 @@ sealed interface ToolResult {
     data class Failure(val message: String) : ToolResult
 }
 
+/**
+ * 工具定义同时描述模型可见的协议和 Kotlin 侧实际执行入口。
+ * 这里的 schema 是轻量元数据：用于生成提示词和让新增工具的参数边界集中可见；
+ * 每个工具仍自行完成与业务语义有关的校验。
+ */
+data class ToolParameterSchema(
+    val name: String,
+    val description: String,
+    val allowedValues: List<String> = emptyList(),
+    val maxLength: Int? = null
+)
+
+interface ToolDefinition {
+    val name: String
+    val description: String
+    val parameterSchema: List<ToolParameterSchema>
+
+    fun execute(arguments: JSONObject, onProgress: (String) -> Unit): ToolResult
+}
+
+/** 显式白名单注册表：模型请求的名字只能命中这里已经注册的工具。 */
+class ToolRegistry(definitions: List<ToolDefinition>) {
+    private val definitionsByName = definitions.associateBy(ToolDefinition::name)
+
+    init {
+        require(definitionsByName.size == definitions.size) { "工具名称不能重复" }
+    }
+
+    fun execute(call: ToolCall, onProgress: (String) -> Unit = {}): ToolResult =
+        definitionsByName[call.name]?.execute(call.arguments, onProgress)
+            ?: ToolResult.Failure("不允许调用工具：${call.name}")
+
+    fun modelInstruction(): String = definitionsByName.values.joinToString("\n") { tool ->
+        val parameters = tool.parameterSchema.joinToString("；") { parameter ->
+            buildString {
+                append("${parameter.name}：${parameter.description}")
+                parameter.allowedValues.takeIf { it.isNotEmpty() }?.let {
+                    append("，仅允许 ${it.joinToString(" 或 ")}")
+                }
+                parameter.maxLength?.let { append("，最多 $it 个字符") }
+            }
+        }
+        "- ${tool.name}：${tool.description}。参数：$parameters"
+    }
+}
+
 /** Kotlin 是工具权限边界：模型只能请求，不能直接执行 Intent。 */
 class AndroidToolExecutor(private val context: Context) {
-    fun execute(call: ToolCall, onProgress: (String) -> Unit = {}): ToolResult = when (call.name) {
-        "open_settings" -> openSettings(call.arguments)
-        "get_weather" -> getWeather(call.arguments, onProgress)
-        "web_search" -> webSearch(call.arguments, onProgress)
-        else -> ToolResult.Failure("不允许调用工具：${call.name}")
-    }
+    private val registry = ToolRegistry(
+        listOf(
+            object : ToolDefinition {
+                override val name = "open_settings"
+                override val description = "打开 App 无法直接修改的 Android 设置页面"
+                override val parameterSchema = listOf(
+                    ToolParameterSchema("page", "要打开的设置页", allowedValues = listOf("wifi", "system"))
+                )
+
+                override fun execute(arguments: JSONObject, onProgress: (String) -> Unit) = openSettings(arguments)
+            },
+            object : ToolDefinition {
+                override val name = "get_weather"
+                override val description = "查询城市当前天气和未来三天预报；不能用于活动或场馆状态"
+                override val parameterSchema = listOf(
+                    ToolParameterSchema("city", "明确的城市名", maxLength = 40)
+                )
+
+                override fun execute(arguments: JSONObject, onProgress: (String) -> Unit) = getWeather(arguments, onProgress)
+            },
+            object : ToolDefinition {
+                override val name = "web_search"
+                override val description = "搜索实时或外部可验证的网页信息"
+                override val parameterSchema = listOf(
+                    ToolParameterSchema("query", "用户问题对应的简洁检索词", maxLength = 240)
+                )
+
+                override fun execute(arguments: JSONObject, onProgress: (String) -> Unit) = webSearch(arguments, onProgress)
+            }
+        )
+    )
+
+    fun execute(call: ToolCall, onProgress: (String) -> Unit = {}): ToolResult =
+        registry.execute(call, onProgress)
+
+    fun modelInstruction(): String = registry.modelInstruction()
 
     private fun openSettings(arguments: JSONObject): ToolResult {
         val page = arguments.optString("page")
@@ -236,26 +312,15 @@ object FunctionCalling {
     const val maxToolCalls = 3
 
     val systemInstruction = """
-        本 App 已具备网页搜索能力。你必须根据问题选择合适工具，不能假装自己无法联网。
-        若要调用工具，只输出一行合法 JSON，不能包含 Markdown、解释或 think 标签：
-        {"tool":"open_settings","arguments":{"page":"wifi"}}
-        open_settings 的 page 仅允许 wifi 或 system。
-        查询天气时可调用：
-        {"tool":"get_weather","arguments":{"city":"北京"}}
-        get_weather 仅用于气温、降水、风力等气象信息；场馆是否开放、航班是否取消、演唱会时间等问题不能调用它。
-        下列问题必须调用 web_search：实时或外部可验证的信息；包含“今天、现在、最新、近期、2026 年”等时效词；
-        新闻、公告、价格、榜单、比赛、人物现职、演唱会/电影/活动/航班/门票/营业时间；
-        或用户要求“查一下、联网搜索、官方消息、给来源”。
-        禁止在以上场景直接回答“无法查询”或建议用户自行访问网站。
-        查询需要最新网页信息时调用：
-        {"tool":"web_search","arguments":{"query":"2026 年 Android 最新版本"}}
-        web_search 的 query 必须是用户问题的简洁检索词。收到搜索结果后，基于结果回答；
-        搜索来源会由 App 在回答下方自动展示。正文中不要输出裸 URL 或 Markdown 链接；
-        搜索未提供的信息要明确说明，不得编造。
-        示例：“五月天演唱会什么时候开始？”和“北京动物园今天闭园吗？”都必须调用 web_search。
-        收到“工具执行结果”后，必须基于结果正常回答，不能再次输出同一个工具调用。
-        只有不依赖实时外部信息的通用知识、写作、翻译、总结、计算等问题，才不调用工具并直接正常回答。
+        必要时可调用受控工具；是否调用由你根据用户问题决定。调用时只能输出完整 JSON：
+        {"tool":"工具名","arguments":{...}}
+        不调用工具时直接正常回答。工具结果返回后必须基于结果回答，不能重复调用同一工具。
+        工具：
+        %s
     """.trimIndent()
+
+    fun systemInstruction(toolInstruction: String): String =
+        systemInstruction.format(toolInstruction)
 
     fun parseToolCall(modelText: String): ToolCall? {
         val rawText = modelText.substringAfterLast("</think>", modelText)

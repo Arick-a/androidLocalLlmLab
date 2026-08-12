@@ -248,9 +248,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         // 因而不会传给 Native 作为 prompt 的一部分。
         val visibleHistory = _messages.value.filter { it.content.isNotBlank() }
         val actualNctx = (_uiState.value as? ChatUiState.Ready)?.nCtx ?: return
-        val systemPrompt = buildFunctionCallingSystemPrompt(
-            _systemPrompt.value.trim().takeIf { it.isNotEmpty() }
-        )
+        val systemPrompt = buildSystemPrompt(_systemPrompt.value.trim().takeIf { it.isNotEmpty() })
         val inferenceConfig = _inferenceConfig.value
         val nativeUserPrompt = prompt.withQwen3ThinkingInstruction()
         _messages.value = visibleHistory + ChatMessage(
@@ -319,13 +317,15 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             val effectiveInferenceConfig = inferenceConfig.copy(
                 maxTokens = minOf(inferenceConfig.maxTokens, availableOutputTokens)
             )
-            val generatedAnswer = generateForCurrentTurn(messagesForModel, effectiveInferenceConfig)
+            val generatedAnswer = generateForCurrentTurn(
+                messages = messagesForModel,
+                inferenceConfig = effectiveInferenceConfig
+            )
             if (_isStopRequested.value) {
                 return generatedAnswer
             }
 
-            val toolCall = FunctionCalling.parseToolCall(generatedAnswer)
-                ?: return generatedAnswer
+            val toolCall = FunctionCalling.parseToolCall(generatedAnswer) ?: return generatedAnswer
             if (attempt == FunctionCalling.maxToolCalls) {
                 error("工具调用次数达到上限")
             }
@@ -479,9 +479,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun buildFunctionCallingSystemPrompt(userSystemPrompt: String?): String = listOfNotNull(
+    private fun buildSystemPrompt(userSystemPrompt: String?): String = listOfNotNull(
         userSystemPrompt,
-        FunctionCalling.systemInstruction
+        FunctionCalling.systemInstruction(toolExecutor.modelInstruction())
     ).joinToString("\n\n")
 
     /**
